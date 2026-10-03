@@ -85,6 +85,10 @@ class DingTalkAdapter {
   async updateBotProfile(entry, body) {
     if (String(body.conversationType) !== "2" || !body.conversationId) return
     const groupId = String(body.conversationId)
+    if (entry.config.lastConversationId !== groupId) {
+      entry.config.lastConversationId = groupId
+      configSave()
+    }
     let robots
     try { robots = await this.getGroupRobots(entry.config, groupId) }
     catch (error) {
@@ -117,6 +121,7 @@ class DingTalkAdapter {
     try { await this.getAccessToken(account); socket = await this.openStream(account) } catch (error) { this.log("error", accountId, error); if (account.autoReconnect !== false) this.scheduleReconnect(account); return }
     const entry = { config: account, bot, socket }
     this.managedAccounts.set(accountId, entry)
+    if (account.lastConversationId) this.updateBotProfile(entry, { conversationType: "2", conversationId: account.lastConversationId, robotCode: account.robotCode }).catch(() => {})
     socket.on("open", () => { this.log("mark", bot.self_id, `钉钉机器人 ${bot.self_id} 已连接`); Bot.em(`connect.${bot.self_id}`, { self_id: bot.self_id, bot }) })
     socket.on("message", data => this.handleStreamMessage(entry, data))
     socket.on("error", error => this.log("error", bot.self_id, "Stream 错误", error))
