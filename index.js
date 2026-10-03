@@ -11,6 +11,8 @@ class DingTalkAdapter {
   version = "1.0.0"
   path = this.name
   managedAccounts = new Map()
+  userInfoCache = new Map()
+  userInfoErrors = new Set()
 
   platformKey(platformId) { return `dd_${encodeURIComponent(String(platformId || "default"))}` }
   log(level, accountId, ...args) { Bot.makeLog(level, args.map(value => Bot.String(value)).join(" "), accountId || this.name, true) }
@@ -43,6 +45,23 @@ class DingTalkAdapter {
     const data = await response.json()
     if (!response.ok || !data.downloadUrl) throw new Error(`下载 DingTalk 文件失败: ${Bot.String(data)}`)
     return data.downloadUrl
+  }
+  async getUserInfo(account, userId) {
+    if (!userId || account.userInfo === false) return {}
+    const accountId = String(account.accountId || account.clientId || "default")
+    const key = `${accountId}:${userId}`
+    const cached = this.userInfoCache.get(key)
+    if (cached && cached.expires > Date.now()) return cached.value
+    const response = await fetch("https://oapi.dingtalk.com/topapi/v2/user/get", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded;charset=utf-8" },
+      body: new URLSearchParams({ access_token: account.accessToken, language: "zh_CN", userid: String(userId) }),
+    })
+    const data = await response.json().catch(() => ({}))
+    if (!response.ok || (data.errcode && Number(data.errcode) !== 0)) throw new Error(`获取 DingTalk 用户详情失败: ${Bot.String(data)}`)
+    const value = data.result || {}
+    this.userInfoCache.set(key, { value, expires: Date.now() + 86400000 })
+    return value
   }
   async startAccount(account) {
     const accountId = String(account.accountId || account.clientId || "default")
@@ -184,6 +203,14 @@ class DingTalkAdapter {
   }
   async decode(body, bot, account) {
     const user_id = String(body.senderStaffId || body.senderId || "unknown"), isGroup = String(body.conversationType) === "2", text = String(body.text?.content || "").trim(), message = text ? [{ type: "text", text }] : []
+    let userInfo = {}
+    if (user_id !== "unknown") {
+      try { userInfo = await this.getUserInfo(account, user_id) }
+      catch (error) {
+        const errorKey = `${account.accountId || account.clientId}:${user_id}`
+        if (!this.userInfoErrors.has(errorKey)) { this.userInfoErrors.add(errorKey); this.log("warn", bot.self_id, "获取用户头像/昵称失败，已使用消息事件信息", error) }
+      }
+    }
     const botAtIds = new Set([body.chatbotUserId, body.robotCode, account.robotCode, account.chatbotUserId].filter(Boolean).map(String))
     let botAt = false
     for (const at of body.atUsers || []) {
@@ -201,7 +228,10 @@ class DingTalkAdapter {
     if (body.msgtype === "file" && body.content?.downloadCode) { const url = await this.downloadFile(account, body.content.downloadCode); message.push({ type: "file", url, file: url, name: body.content.fileName }) }
     if (body.msgtype === "richText") for (const item of body.content?.richText || []) { if (item.text) message.push({ type: "text", text: item.text }); const code = item.downloadCode || item.pictureDownloadCode; if (code) { const url = await this.downloadFile(account, code); message.push({ type: "image", url, file: url }) } }
     if (!message.length) return null
-    const data = { bot, adapter_id: this.id, adapter_name: this.name, post_type: "message", message_type: isGroup ? "group" : "private", sub_type: "normal", self_id: bot.self_id, user_id, message_id: String(body.msgId || Date.now()), raw_message: text, message, sender: { user_id, nickname: body.senderNick || user_id, card: body.senderNick || "", role: body.isAdmin ? "admin" : "member" }, time: Math.floor(Number(body.createAt || Date.now()) / 1000), sessionWebhook: body.sessionWebhook, conversationId: body.conversationId, dingtalk_event: body, atme: botAt || Boolean(body.isInAtList) }
+    const nickname = body.senderNick || userInfo.name || userInfo.nickname || user_id
+    const sender = { user_id, nickname, avatar: body.senderAvatar || userInfo.avatar || "", card: nickname, role: body.isAdmin ? "admin" : "member" }
+    bot.fl.set(user_id, sender)
+    const data = { bot, adapter_id: this.id, adapter_name: this.name, post_type: "message", message_type: isGroup ? "group" : "private", sub_type: "normal", self_id: bot.self_id, user_id, message_id: String(body.msgId || Date.now()), raw_message: text, message, sender, nickname, avatar: sender.avatar, time: Math.floor(Number(body.createAt || Date.now()) / 1000), sessionWebhook: body.sessionWebhook, conversationId: body.conversationId, dingtalk_event: body, atme: botAt || Boolean(body.isInAtList) }
     if (isGroup) { data.group_id = String(body.conversationId); data.group_name = body.conversationTitle || "DingTalk 群聊"; data.group = this.pickGroup(bot, data.group_id, data) } else data.friend = this.pickFriend(bot, user_id, data)
     return data
   }

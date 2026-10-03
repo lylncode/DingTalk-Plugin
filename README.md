@@ -6,6 +6,12 @@
 
 `webhook` 是主动发送消息时的回退地址；事件回复优先使用钉钉回调携带的 `sessionWebhook`。
 
+### 用户昵称和头像
+
+钉钉 Stream 消息事件自带 `senderNick`，适配器会优先使用它。为了补全用户头像，适配器还会使用事件中的 `senderStaffId` 调用钉钉官方的[查询用户详情接口](https://open.dingtalk.com/document/development/query-user-details)：`POST https://oapi.dingtalk.com/topapi/v2/user/get`，读取返回结果的 `name` 和 `avatar` 字段，并按账号缓存 24 小时。需要在钉钉开发者后台为企业内部应用申请“通讯录管理-成员信息读权限”，管理员审批发布后才会返回通讯录资料；没有权限或用户不是企业通讯录成员时，消息仍会正常处理，只使用事件中的昵称。
+
+该接口获取的是消息发送者的资料，不是机器人自己的资料。钉钉 Stream 回调中的 `chatbotUserId` 是机器人平台 ID，不能直接作为通讯录 `userid` 查询机器人头像。椰奶状态中的机器人名称和头像继续使用账号配置的 `botName`、`botAvatar`。
+
 DingTalk Bot 的平台账号 ID 统一使用 `dd_` 前缀。钉钉回调中的 `chatbotUserId` 才是真实的平台 Bot ID；由于 Yunzai 的主人配置使用冒号分隔 Bot ID 和用户 ID，适配器会对平台 ID 做 URL 编码。例如平台 ID 为 `$:LWCP_v1:$...` 时，`self_id` 为 `dd_%24%3ALWCP_v1%3A%24...`，原始值保存在 `bot.dingtalk_id`。适配器收到第一条回调后会按这个 ID 注册 `self_id`、`uin` 和 `Bot[id]`，并将它保存为账号的 `platformId`，后续重启直接使用同一个 ID。配置里的 `accountId` 只是本地账号标识，用于连接建立前识别账号，仍可填写自定义名称。
 
 如果之前使用过未编码的 `dd_$:LWCP...` 设置过主人，请在适配器识别并保存新 ID 后重启一次，再重新执行 `#设置主人`，让主人配置写入新的 `dd_%24%3A...:用户ID` 格式。整个转换只在适配器内完成，不需要修改 TRSS-Yunzai 框架解析器。
