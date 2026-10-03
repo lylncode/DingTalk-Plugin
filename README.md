@@ -12,6 +12,8 @@
 
 该接口获取的是消息发送者的资料，不是机器人自己的资料。钉钉 Stream 回调中的 `chatbotUserId` 是机器人平台 ID，不能直接作为通讯录 `userid` 查询机器人头像。椰奶状态中的机器人名称和头像继续使用账号配置的 `botName`、`botAvatar`。
 
+钉钉还提供[获取群内机器人列表](https://open.dingtalk.com/document/development/obtain-the-list-of-robots-in-the-group)接口。适配器收到群消息后会按 `conversationId` 查询该群的机器人列表，匹配事件中的 `robotCode`，自动使用返回的 `name` 和 `downloadIconURL` 更新 Bot 名称和头像，并缓存 24 小时。该接口需要额外申请“钉钉群基础信息管理权限”（权限标识 `qyapi_chat_manage`）。未开通时不会影响消息处理，适配器继续使用配置值。私聊事件没有群会话 ID，无法通过此接口查询。
+
 DingTalk Bot 的平台账号 ID 统一使用 `dd_` 前缀。钉钉回调中的 `chatbotUserId` 才是真实的平台 Bot ID；由于 Yunzai 的主人配置使用冒号分隔 Bot ID 和用户 ID，适配器会对平台 ID 做 URL 编码。例如平台 ID 为 `$:LWCP_v1:$...` 时，`self_id` 为 `dd_%24%3ALWCP_v1%3A%24...`，原始值保存在 `bot.dingtalk_id`。适配器收到第一条回调后会按这个 ID 注册 `self_id`、`uin` 和 `Bot[id]`，并将它保存为账号的 `platformId`，后续重启直接使用同一个 ID。配置里的 `accountId` 只是本地账号标识，用于连接建立前识别账号，仍可填写自定义名称。
 
 如果之前使用过未编码的 `dd_$:LWCP...` 设置过主人，请在适配器识别并保存新 ID 后重启一次，再重新执行 `#设置主人`，让主人配置写入新的 `dd_%24%3A...:用户ID` 格式。整个转换只在适配器内完成，不需要修改 TRSS-Yunzai 框架解析器。

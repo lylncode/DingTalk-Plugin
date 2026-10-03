@@ -13,6 +13,8 @@ class DingTalkAdapter {
   managedAccounts = new Map()
   userInfoCache = new Map()
   userInfoErrors = new Set()
+  groupRobotCache = new Map()
+  groupRobotErrors = new Set()
 
   platformKey(platformId) { return `dd_${encodeURIComponent(String(platformId || "default"))}` }
   log(level, accountId, ...args) { Bot.makeLog(level, args.map(value => Bot.String(value)).join(" "), accountId || this.name, true) }
@@ -62,6 +64,49 @@ class DingTalkAdapter {
     const value = data.result || {}
     this.userInfoCache.set(key, { value, expires: Date.now() + 86400000 })
     return value
+  }
+  async getGroupRobots(account, groupId) {
+    if (!groupId) return []
+    const accountId = String(account.accountId || account.clientId || "default")
+    const key = `${accountId}:${groupId}`
+    const cached = this.groupRobotCache.get(key)
+    if (cached && cached.expires > Date.now()) return cached.value
+    const response = await fetch("https://api.dingtalk.com/v1.0/robot/groups/robots/query", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-acs-dingtalk-access-token": account.accessToken },
+      body: JSON.stringify({ openConversationId: String(groupId) }),
+    })
+    const data = await response.json().catch(() => ({}))
+    if (!response.ok) throw new Error(`获取 DingTalk 群机器人列表失败: ${Bot.String(data)}`)
+    const value = Array.isArray(data.chatbotInstanceVOList) ? data.chatbotInstanceVOList : []
+    this.groupRobotCache.set(key, { value, expires: Date.now() + 86400000 })
+    return value
+  }
+  async updateBotProfile(entry, body) {
+    if (String(body.conversationType) !== "2" || !body.conversationId) return
+    const groupId = String(body.conversationId)
+    let robots
+    try { robots = await this.getGroupRobots(entry.config, groupId) }
+    catch (error) {
+      const errorKey = `${entry.config.accountId || entry.config.clientId}:${groupId}`
+      if (!this.groupRobotErrors.has(errorKey)) { this.groupRobotErrors.add(errorKey); this.log("warn", entry.bot.self_id, "获取群内机器人资料失败，已使用配置名称/头像", error) }
+      return
+    }
+    const codes = new Set([body.robotCode, entry.config.robotCode, entry.config.clientId].filter(Boolean).map(String))
+    const profile = robots.find(item => codes.has(String(item.robotCode))) || (robots.length === 1 ? robots[0] : null)
+    if (!profile) return
+    let changed = false
+    if (profile.name && (!entry.config.botName || entry.config.botName === entry.bot.nickname)) {
+      entry.config.botName = String(profile.name)
+      entry.bot.nickname = String(profile.name)
+      changed = true
+    }
+    if (profile.downloadIconURL && (!entry.config.botAvatar || entry.config.botAvatar === entry.bot.avatar)) {
+      entry.config.botAvatar = String(profile.downloadIconURL)
+      entry.bot.avatar = String(profile.downloadIconURL)
+      changed = true
+    }
+    if (changed) configSave()
   }
   async startAccount(account) {
     const accountId = String(account.accountId || account.clientId || "default")
@@ -236,7 +281,7 @@ class DingTalkAdapter {
     return data
   }
   handleStreamMessage(entry, raw) {
-    Promise.resolve().then(async () => { const envelope = JSON.parse(raw.toString()); if (envelope.type === "SYSTEM" && envelope.headers?.topic === "ping") return entry.socket.send(JSON.stringify({ code: 200, headers: envelope.headers, message: "OK", data: envelope.data })); if (envelope.type !== "CALLBACK") return; const body = typeof envelope.data === "string" ? JSON.parse(envelope.data) : envelope.data; this.bindPlatformId(entry, body.chatbotUserId); const data = await this.decode(body, entry.bot, entry.config); if (data) { entry.bot.stat.message_received = (entry.bot.stat.message_received || 0) + 1; this.log("info", entry.bot.self_id, `${data.message_type === "group" ? "群" : "私聊"}消息：${data.raw_message}`); Bot.em(`message.${data.message_type}`, data) } if (envelope.headers?.messageId) entry.socket.send(JSON.stringify({ code: 200, headers: { ...envelope.headers, content_type: "application/json" }, message: "OK", data: JSON.stringify({ status: "SUCCESS", message: "OK" }) })) }).catch(error => this.log("error", entry.bot.self_id, "Stream 消息处理失败", error))
+    Promise.resolve().then(async () => { const envelope = JSON.parse(raw.toString()); if (envelope.type === "SYSTEM" && envelope.headers?.topic === "ping") return entry.socket.send(JSON.stringify({ code: 200, headers: envelope.headers, message: "OK", data: envelope.data })); if (envelope.type !== "CALLBACK") return; const body = typeof envelope.data === "string" ? JSON.parse(envelope.data) : envelope.data; this.bindPlatformId(entry, body.chatbotUserId); await this.updateBotProfile(entry, body); const data = await this.decode(body, entry.bot, entry.config); if (data) { entry.bot.stat.message_received = (entry.bot.stat.message_received || 0) + 1; this.log("info", entry.bot.self_id, `${data.message_type === "group" ? "群" : "私聊"}消息：${data.raw_message}`); Bot.em(`message.${data.message_type}`, data) } if (envelope.headers?.messageId) entry.socket.send(JSON.stringify({ code: 200, headers: { ...envelope.headers, content_type: "application/json" }, message: "OK", data: JSON.stringify({ status: "SUCCESS", message: "OK" }) })) }).catch(error => this.log("error", entry.bot.self_id, "Stream 消息处理失败", error))
   }
 }
 
