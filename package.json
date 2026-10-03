@@ -1,0 +1,34 @@
+{
+  "name": "dingtalk-plugin",
+  "description": "独立的 TRSS-Yunzai DingTalk 适配器",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "index.js",
+  "files": [
+    "index.js",
+    "lib",
+    "guoba.support.js",
+    "README.md"
+  ],
+  "author": "TRSS-Yunzai community",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/lylncode/DingTalk-Plugin"
+  },
+  "keywords": [
+    "bot",
+    "dingding",
+    "dingtalk",
+    "adapter",
+    "chatbot",
+    "trss-yunzai",
+    "im",
+    "chat",
+    "钉钉"
+  ],
+  "dependencies": {
+    "ws": "^8.18.0",
+    "yaml": "^2.8.1"
+  }
+}
