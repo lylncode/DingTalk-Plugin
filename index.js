@@ -600,25 +600,21 @@ const adapter = new (class DingTalkAdapter {
     return out.join("")
   }
 
-  // 递归收集 http 跳转按钮（含 node 内层）：转 ActionCard 发送
+  // 递归收集 http 跳转按钮（含 node 内层）：兼容任意嵌套深度与被反引号包裹的 URL，
+  // 叶子按钮为 { text, link }，转 ActionCard 发送
   getActionButtons(message) {
     const buttons = []
     const visit = item => {
       if (!item) return
       if (Array.isArray(item)) return item.forEach(visit)
       if (typeof item !== "object") return
-      const data = item.data || item
-      if (item.type === "button") {
-        for (const row of Array.isArray(data) ? data : [data]) {
-          for (const button of Array.isArray(row) ? row : [row]) {
-            const link = button?.link
-            if (button?.text && /^https?:\/\//i.test(link || ""))
-              buttons.push({ title: String(button.text), actionURL: link })
-          }
-        }
-      } else if (item.type === "node") {
-        for (const node of data || []) visit(node.message || node)
+      if (item.type === "node") return (item.data || []).forEach(node => visit(node.message || node))
+      if (typeof item.text === "string" && typeof item.link === "string") {
+        const link = item.link.replace(/`/g, "")
+        if (/^https?:\/\//i.test(link)) buttons.push({ title: item.text, actionURL: link })
+        return
       }
+      visit(item.data ?? item.button ?? item.buttons)
     }
     visit(message)
     return buttons
@@ -667,26 +663,28 @@ const adapter = new (class DingTalkAdapter {
     const markdown = this.hasMarkdown(message)
     const text = (await this.renderMessage(message, !markdown)).trim()
     const buttons = this.getActionButtons(message)
+    Bot.makeLog("debug", ["markdown 段:", markdown, "按钮:", buttons.length, buttons], this.logId(bot.self_id))
     if (!text && !buttons.length) return false
     if (buttons.length > 5)
       this.log("warn", bot.self_id, "钉钉 ActionCard 最多支持 5 个跳转按钮，已截取前 5 个")
     const cardButtons = buttons.slice(0, 5)
+    // Webhook 方式的 ActionCard 参数：btns 数组（接口方式的 actionTitleN 平铺字段此处不生效）；
+    // text 服务端强制非空（空格也会被 trim 判空），纯按钮时用不间断空格实体兜底，渲染后不可见
+    const actionCard = {
+      title: bot.nickname || "DingTalk",
+      text: text || "&nbsp;",
+      btnOrientation: "0",
+      btns: cardButtons,
+    }
     const payload = cardButtons.length
-      ? {
-          msgtype: "actionCard",
-          actionCard: {
-            title: bot.nickname || "DingTalk",
-            text: text || " ",
-            btnOrientation: "0",
-            btns: cardButtons,
-          },
-        }
+      ? { msgtype: "actionCard", actionCard }
       : markdown
         ? { msgtype: "markdown", markdown: { title: bot.nickname || "DingTalk", text } }
         : { msgtype: "text", text: { content: text } }
     await this.postWebhook(webhook, payload)
     const target = data.group_id ? `群消息：[${data.group_id}]` : `好友消息：[${data.user_id || "unknown"}]`
-    Bot.makeLog("info", [target, text || "[ActionCard]"], this.logId(bot.self_id))
+    const brief = cardButtons.length ? `[ActionCard:${cardButtons.length}按钮] ${text}` : text
+    Bot.makeLog("info", [target, brief], this.logId(bot.self_id))
     bot.stat.message_sent = (bot.stat.message_sent || 0) + 1
     return { message_id: `${bot.self_id}_${Date.now().toString(36)}` }
   }

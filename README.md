@@ -52,7 +52,7 @@ git clone --depth=1 https://github.com/lylncode/DingTalk-Plugin.git ./plugins/Di
 ## 图片与图床
 
 - 纯图片消息：走钉钉接口方式上传 media_id 发送，**无需图床**
-- 图文混排 / Markdown 消息中的图片：钉钉要求公网 URL，发送时优先调用全局 `Bot.imageToUrl`（安装 [ImageBed-Plugin](https://github.com/TimeRainStarSky/Yunzai-ImageBed-Plugin) 并配置图床即可），调用失败回退 `Bot.fileToUrl`（TRSS 文件服务地址，需钉钉客户端可访问）
+- 图文混排 / Markdown 消息中的图片：钉钉要求公网 URL，发送时优先调用全局 `Bot.imageToUrl`（安装 [ImageBed-Plugin](https://gitee.com/wind-trace-typ/ImageBed-Plugin) 并配置图床即可），调用失败回退 `Bot.fileToUrl`（TRSS 文件服务地址，需钉钉客户端可访问）
 
 ## 群管理
 
@@ -92,12 +92,6 @@ git clone --depth=1 https://github.com/lylncode/DingTalk-Plugin.git ./plugins/Di
 - 机器人名称 / 头像：群聊事件自动查询群机器人列表回填真实资料；私聊场景使用账号配置的 `botName` / `botAvatar`
 - 用户昵称 / 头像：优先事件自带 `senderNick`，头像通过通讯录用户详情接口补全（需成员信息读权限，未开通不影响消息处理）
 - 默认 Webhook：回复消息优先使用事件自带 `sessionWebhook`，主动发送（无 sessionWebhook）时回退账号配置的默认 Webhook
-
-## 贡献者
-
-<a href="https://github.com/lylncode/DingTalk-Plugin/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=lylncode/DingTalk-Plugin" alt="贡献者"/>
-</a>
 
 ## 相关链接
 
