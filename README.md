@@ -1,94 +1,106 @@
-# DingTalk
+<div align="center">
 
-这是一个独立的 TRSS-Yunzai 插件，结构参考 `Ding-plugin`，使用钉钉 Stream 模式接收消息，支持多账号、私聊、群聊、Markdown、图片链接和文件链接。
+# TRSS-Yunzai DingTalk Plugin
 
-将本目录放入 `plugins/DingTalk-Plugin` 后重启。首次加载会生成根目录 `config/DingTalk.yaml`，填写其中的 `accountId`、`clientId`（AppKey）和 `clientSecret`（AppSecret），并在钉钉开发者后台订阅机器人 Stream 事件。
+TRSS-Yunzai 钉钉适配器插件
 
-`webhook` 是主动发送消息时的回退地址；事件回复优先使用钉钉回调携带的 `sessionWebhook`。
+基于钉钉官方 Stream 模式，支持钉钉私聊 / 群聊消息收发与群管理
 
-### 用户昵称和头像
+</div>
 
-钉钉 Stream 消息事件自带 `senderNick`，适配器会优先使用它。为了补全用户头像，适配器还会使用事件中的 `senderStaffId` 调用钉钉官方的[查询用户详情接口](https://open.dingtalk.com/document/development/query-user-details)：`POST https://oapi.dingtalk.com/topapi/v2/user/get`，读取返回结果的 `name` 和 `avatar` 字段，并按账号缓存 24 小时。需要在钉钉开发者后台为企业内部应用申请“通讯录管理-成员信息读权限”，管理员审批发布后才会返回通讯录资料；没有权限或用户不是企业通讯录成员时，消息仍会正常处理，只使用事件中的昵称。
+## 🐬 安装教程
 
-该接口获取的是消息发送者的资料，不是机器人自己的资料。钉钉 Stream 回调中的 `chatbotUserId` 是机器人平台 ID，不能直接作为通讯录 `userid` 查询机器人头像。椰奶状态中的机器人名称和头像继续使用账号配置的 `botName`、`botAvatar`。
+需要先准备 [TRSS-Yunzai](../../../Yunzai)
 
-钉钉还提供[获取群内机器人列表](https://open.dingtalk.com/document/development/obtain-the-list-of-robots-in-the-group)接口。适配器收到群消息后会按 `conversationId` 查询该群的机器人列表，匹配事件中的 `robotCode`，自动使用返回的 `name` 和 `downloadIconURL` 更新 Bot 名称和头像，并缓存 24 小时。该接口需要额外申请“钉钉群基础信息管理权限”（权限标识 `qyapi_chat_manage`）。未开通时不会影响消息处理，适配器继续使用配置值。私聊事件没有群会话 ID，无法通过此接口查询。
+<details>
+  <summary>展开/收起</summary>
 
-首次成功查询后会保存最近一次 `conversationId`，后续重启连接时自动刷新资料。升级适配器后请重启一次，并在目标群发送一条消息触发首次识别。
+#### 🔧 Yunzai 根目录执行命令安装
 
-DingTalk Bot 的平台账号 ID 统一使用 `dd_` 前缀。钉钉回调中的 `chatbotUserId` 才是真实的平台 Bot ID；由于 Yunzai 的主人配置使用冒号分隔 Bot ID 和用户 ID，适配器会对平台 ID 做 URL 编码。例如平台 ID 为 `$:LWCP_v1:$...` 时，`self_id` 为 `dd_%24%3ALWCP_v1%3A%24...`，原始值保存在 `bot.dingtalk_id`。适配器收到第一条回调后会按这个 ID 注册 `self_id`、`uin` 和 `Bot[id]`，并将它保存为账号的 `platformId`，后续重启直接使用同一个 ID。配置里的 `accountId` 只是本地账号标识，用于连接建立前识别账号，仍可填写自定义名称。
-
-如果之前使用过未编码的 `dd_$:LWCP...` 设置过主人，请在适配器识别并保存新 ID 后重启一次，再重新执行 `#设置主人`，让主人配置写入新的 `dd_%24%3A...:用户ID` 格式。整个转换只在适配器内完成，不需要修改 TRSS-Yunzai 框架解析器。
-
-### 椰奶状态中的名称和头像
-
-椰奶状态读取的是 TRSS-Yunzai 中 DingTalk Bot 对象的 `nickname` 和 `avatar`。钉钉 Stream 消息事件不包含机器人头像，AppKey 也不是 QQ 号，因此无法使用 QQ 头像地址自动生成头像。适配器支持在每个账号上配置：
-
-- `botName`：状态页展示名称；不填写时使用 `DingTalkBot (账号标识)`。
-- `botAvatar`：状态页头像 URL。请填写 Yunzai 服务器能访问的图片地址；留空时椰奶状态使用默认头像。
-
-可以在锅巴的 DingTalk 账号设置中填写这两个字段，保存后重启 Yunzai 生效。也可以直接编辑 `config/DingTalk.yaml` 对应账号项：
-
-```yaml
-dingdingAccounts:
-  - accountId: DingDing
-    botName: 我的钉钉机器人
-    botAvatar: https://example.com/bot-avatar.png
-    clientId: your-app-key
-    clientSecret: your-app-secret
+```bash
+git clone --depth=1 https://github.com/lylncode/DingTalk-Plugin.git ./plugins/DingTalk-Plugin
 ```
 
-### 发送按钮
+> [!NOTE]
+> 如果你的网络环境较差，无法连接到 Github，可以使用代理加速下载服务
+>
+> ```bash
+> git clone --depth=1 https://ghproxy.521002.xyz/https://github.com/lylncode/DingTalk-Plugin.git ./plugins/DingTalk-Plugin
+> ```
 
-消息中的 TRSS `segment.button` 会转换为钉钉 ActionCard。当前支持带 `link` 的网页跳转按钮，每张卡片最多发送 5 个按钮：
+#### 🔧 创建应用
 
-```js
-await e.reply([
-  '请选择：',
-  segment.button([
-    [{ text: '打开文档', link: 'https://example.com/docs' }],
-    [{ text: '访问主页', link: 'https://example.com' }],
-  ]),
-])
-```
+1. 打开 [钉钉开发者后台](https://open.dingtalk.com) 创建企业内部应用，获取 `Client ID` 和 `Client Secret`
+2. 应用内启用机器人能力，消息接收模式选择 **Stream 模式**，发布应用
+3. 权限管理中申请「钉钉群基础信息管理权限」（群机器人资料回填、建群等群管理能力）
 
-钉钉自定义机器人 webhook 的 ActionCard 按钮是链接跳转，不支持 TRSS 按钮的 `callback` 或 `input` 交互；这些按钮会被忽略。没有可用链接按钮时仍按普通 Markdown 消息发送。
+</details>
 
-### 图片与图床
+## 使用教程
 
-DingTalk 发送图片时会先检查全局 `Bot.imageToUrl`：
-
-1. 已安装并配置 `ImageBed-Plugin` 时，会自动使用它的图床优先级和上传配置，不需要额外修改 DingTalk。
-2. 也可以自行写一个独立的单 JS 插件，在加载时设置 `Bot.imageToUrl`。下面示例可保存为 `plugins/My-ImageBed/index.js`。示例约定图床接收名为 `file` 的 multipart 字段，并返回 JSON `{ "url": "https://..." }`；请按实际图床 API 修改上传地址、鉴权方式、表单字段和返回值解析：
-
-   ```js
-   const uploadUrl = 'https://your-image-host.example/api/upload'
-   const token = '在这里填写图床 Token'
-
-   Bot.imageToUrl = async (file, opts = {}) => {
-     const buffer = file?.buffer || file?.file || file
-     if (!Buffer.isBuffer(buffer)) throw new TypeError('图床收到的图片不是 Buffer')
-
-     const form = new FormData()
-     form.append('file', new Blob([buffer]), opts.name || file?.name || 'image.png')
-     const response = await fetch(uploadUrl, {
-       method: 'POST',
-       headers: { Authorization: `Bearer ${token}` },
-       body: form,
-     })
-     const result = await response.json()
-     if (!response.ok || typeof result.url !== 'string') {
-       throw new Error(`图床上传失败 (${response.status}): ${JSON.stringify(result)}`)
-     }
-     return result.url
-   }
-   ```
-
-   该插件不需要导出 `apps`，加载后设置全局 `Bot.imageToUrl` 即可。函数收到 TRSS 文件对象（通常含 `buffer` 和 `name`）以及可选参数 `{ name }`，必须返回钉钉可访问的公网图片 URL。请把 Token 放在本机私有配置中，不要提交到 Git。自定义图床和 `ImageBed-Plugin` 都会设置同一个全局接口，建议只启用其中一种，避免互相覆盖。
-3. 如果没有 `Bot.imageToUrl`，或调用失败，DingTalk 会回退到 TRSS 的 `Bot.fileToUrl`。回退地址要求钉钉客户端能访问 TRSS 文件服务；文件消息仍使用 `Bot.fileToUrl`。
-
-管理命令：
-
-- `#DingTalk账号` 查看账号状态
-- `#DingTalk设置账号标识:AppKey:AppSecret[:默认Webhook]` 添加或更新账号
+- `#DingTalk账号` 查看已连接账号
+- `#DingTalk设置ClientId:ClientSecret[:默认Webhook]` 添加或更新账号
 - `#DingTalk重载` 保存当前配置
+
+配置文件 `config/DingTalk.yaml` 也可直接编辑，支持锅巴配置
+
+## 消息支持
+
+- 收：文本、@、图片、文件、语音、视频、富文本
+- 发：纯文本、Markdown（`segment.markdown` 段）、按钮 ActionCard、图片 / 语音 / 视频 / 文件（接口方式，media_id 上传，本地 / 网页 / base64 / dataURL 源均可）
+- 引用回复：纯文本「回复：」前缀展示
+
+## 图片与图床
+
+- 纯图片消息：走钉钉接口方式上传 media_id 发送，**无需图床**
+- 图文混排 / Markdown 消息中的图片：钉钉要求公网 URL，发送时优先调用全局 `Bot.imageToUrl`（安装 [ImageBed-Plugin](https://github.com/TimeRainStarSky/Yunzai-ImageBed-Plugin) 并配置图床即可），调用失败回退 `Bot.fileToUrl`（TRSS 文件服务地址，需钉钉客户端可访问）
+
+## 群管理
+
+- `Bot[id].createGroup({ name, owner, members })` 创建内部群，返回群 ID
+- `group.setGroupName(name)` 修改群名（仅限本插件创建的群，钉钉 chatid 限制）
+- `group.addMember(uid)` 拉人进群，支持单个或数组
+
+## 配置说明
+
+配置文件 `config/DingTalk.yaml`：
+
+- `permission`：管理指令权限，默认 `master`
+- `dingdingAccounts`：账号列表，`#DingTalk设置` 命令或锅巴添加，每账号支持：
+  - `clientId` / `clientSecret`：应用凭证（必填）
+  - `webhook`：默认 Webhook，主动发送（无 sessionWebhook）时的回退地址
+  - `botName` / `botAvatar`：状态页展示的机器人名称 / 头像（群聊事件会自动回填真实资料）
+  - `userInfo`：设为 `false` 关闭通讯录用户详情查询
+  - `autoReconnect`：断线自动重连，默认开启
+- `platformId` / `robotCode` / `chatIds` 等字段由适配器自动学习回写，无需手动填写
+
+## 权限要求
+
+钉钉开发者后台 → 应用 → 权限管理中申请：
+
+| 能力 | 权限点 | 说明 |
+| --- | --- | --- |
+| 消息收发 | 机器人能力 | 启用机器人 + Stream 模式即可，无需额外权限点 |
+| 群聊接口发送（媒体） | 机器人发送群聊消息 | 图片 / 语音 / 视频 / 文件走接口方式时需要 |
+| 单聊接口发送（媒体） | 机器人发送单聊消息 | 私聊发媒体时需要 |
+| 媒体上传 | 调用企业 API 基础权限 | 默认具备 |
+| 用户昵称 / 头像补全 | 通讯录管理-成员信息读权限 | 未开通不影响消息处理，仅使用事件自带昵称 |
+| 群机器人资料回填 / 建群 / 改群名 / 拉人 | 钉钉群基础信息管理权限（`qyapi_chat_manage`） | 未开通时群管理相关能力不可用 |
+
+## 平台说明
+
+- 平台 ID：钉钉回调的 `chatbotUserId` 为真实 Bot ID，适配器收到首条消息后自动学习保存，`self_id` 为 `dd_` 前缀 URL 编码形式；主人配置需使用该 ID
+- 机器人名称 / 头像：群聊事件自动查询群机器人列表回填真实资料；私聊场景使用账号配置的 `botName` / `botAvatar`
+- 用户昵称 / 头像：优先事件自带 `senderNick`，头像通过通讯录用户详情接口补全（需成员信息读权限，未开通不影响消息处理）
+- 默认 Webhook：回复消息优先使用事件自带 `sessionWebhook`，主动发送（无 sessionWebhook）时回退账号配置的默认 Webhook
+
+## 贡献者
+
+<a href="https://github.com/lylncode/DingTalk-Plugin/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=lylncode/DingTalk-Plugin" alt="贡献者"/>
+</a>
+
+## 相关链接
+
+- 许可证：MIT（[LICENSE](LICENSE)）
+- TRSS-Yunzai：https://github.com/TimeRainStarSky/Yunzai
