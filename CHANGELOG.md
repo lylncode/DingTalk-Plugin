@@ -10,6 +10,7 @@
 - 语音 / 视频接收：单聊事件 `audio` / `video` 类型经 `messageFiles/download` 换取 CDN 地址，映射为 `audio` / `video` 段
 - 群管理能力：`Bot[id].createGroup({ name, owner, members })` 创建内部群、`group.setGroupName(name)` 修改群名、`group.addMember(uid)` 拉人进群（需「钉钉群基础信息管理权限」；改群名仅限本插件创建的群，chatid 由创建群接口获取并持久化）
 - 机器人基础信息完善：bot 注册补齐 `info` / `getFriendMap` / `getGroupMap` / `getMemberMap` / `pickUser` / `login` / `logout`（对齐 QQBot-Plugin）；群聊事件自动查询群机器人列表回填真实名称 / 头像
+- 配置自动热重载：基于配置文件监听（chokidar），`config/DingTalk.yaml` 变更后自动对比账号配置，新增 / 变更的账号自动重连、删除的账号自动断开，无需重启或手动重载；移除 `#DingTalk重载` 命令
 
 ### 优化
 

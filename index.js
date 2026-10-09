@@ -3,11 +3,13 @@ logger.info(logger.yellow("- 正在加载 DingTalk 适配器插件"))
 import { readFileSync } from "fs"
 import { WebSocket } from "ws"
 import makeConfig from "../../lib/plugins/config.js"
+import chokidar from "chokidar"
+import _ from "lodash"
 
 // 插件版本号从 package.json 读取
 const { version } = JSON.parse(readFileSync(new URL("./package.json", import.meta.url)))
 
-const { config, configSave } = await makeConfig(
+const { config, configSave, configFile } = await makeConfig(
   "DingTalk",
   {
     tips: "",
@@ -21,6 +23,8 @@ const { config, configSave } = await makeConfig(
       "欢迎使用 TRSS-Yunzai DingTalk Plugin !",
     ],
   },
+  // 监听配置文件变化，实现配置热重载
+  { watch: true },
 )
 
 const adapter = new (class DingTalkAdapter {
@@ -875,11 +879,6 @@ export class DingTalkPlugin extends plugin {
           fnc: "Set",
           permission: config.permission,
         },
-        {
-          reg: "^#?DingTalk重载$",
-          fnc: "Reload",
-          permission: config.permission,
-        },
       ],
     })
   }
@@ -922,11 +921,31 @@ export class DingTalkPlugin extends plugin {
     }
     return this.reply(`账号 ${accountId} 已保存并尝试连接。`, true)
   }
-
-  async Reload() {
-    await configSave()
-    return this.reply("DingTalk 配置已保存；连接会在下次重启时按新配置建立。", true)
-  }
 }
 
 logger.info(logger.green("- DingTalk 适配器插件 加载完成"))
+
+// 配置热重载：核心 watcher 监听 yaml 变化并 merge 进 config 对象（5 秒防抖），本监听器在
+// 同一文件变化后延迟对比（晚于核心 watcher 的 5 秒防抖 merge，确保读到最新配置）
+// 对比时剔除适配器自动学习回写的字段（platformId/robotCode/chatIds 等），仅用户可编辑项触发重连
+const AUTO_FIELDS = new Set(["platformId", "robotCode", "chatIds", "lastConversationId", "accessToken", "tokenTimer"])
+const accountSignature = account =>
+  JSON.stringify(Object.fromEntries(Object.entries(account || {}).filter(([key]) => !AUTO_FIELDS.has(key))))
+let oldAccounts = new Map(
+  (Array.isArray(config.dingdingAccounts) ? config.dingdingAccounts : []).map(item => [item.accountId, accountSignature(item)]),
+)
+chokidar.watch(configFile).on("change", _.debounce(async () => {
+  const accounts = Array.isArray(config.dingdingAccounts) ? config.dingdingAccounts : []
+  const cur = new Map(accounts.map(item => [item.accountId, accountSignature(item)]))
+  for (const [accountId, signature] of cur) {
+    if (oldAccounts.get(accountId) === signature) continue
+    const account = accounts.find(item => item.accountId === accountId)
+    await adapter.stopAccount(accountId).catch(() => {})
+    await adapter.startAccount(account).catch(error =>
+      Bot.makeLog("error", ["账号重载失败", error], accountId, true),
+    )
+  }
+  for (const accountId of oldAccounts.keys())
+    if (!cur.has(accountId)) await adapter.stopAccount(accountId).catch(() => {})
+  oldAccounts = cur
+}, 6000))

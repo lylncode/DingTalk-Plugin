@@ -40,7 +40,6 @@ git clone --depth=1 https://github.com/lylncode/DingTalk-Plugin.git ./plugins/Di
 
 - `#DingTalk账号` 查看已连接账号
 - `#DingTalk设置ClientId:ClientSecret[:默认Webhook]` 添加或更新账号
-- `#DingTalk重载` 保存当前配置
 
 配置文件 `config/DingTalk.yaml` 也可直接编辑，支持锅巴配置
 
