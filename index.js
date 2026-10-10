@@ -497,8 +497,9 @@ const adapter = new (class DingTalkAdapter {
   }
 
   // 媒体段 → 接口方式 msgParam：统一上传 mediaId（本地/网页/base64/dataURL 源由 Bot.fileType 统一处理）
+  // 兼容两种段结构：{ type, data } 与 oicq 平铺 { type, file, name }
   async makeMediaParam(account, segment) {
-    const data = segment.data
+    const data = segment.data || segment
     switch (segment.type) {
       case "image": {
         const file = await Bot.fileType(data, { http: true })
@@ -642,7 +643,42 @@ const adapter = new (class DingTalkAdapter {
       this.log("error", bot.self_id, "bot 未注册或已断开，无法发送消息")
       return false
     }
-    // webhook 不支持图片/语音/文件/视频，仅含媒体段时改走接口方式发送
+    // 消息分段发送：钉钉单条消息无法图文混排原生图片，按段顺序拆组——
+    // 连续媒体段（image/audio/video/file）一组走接口方式，其余段合并一组走 Webhook；
+    // 携带 markdown 段时图片内嵌为公网 URL，保持整条一条消息
+    const segments = Array.isArray(message) ? [...message] : [message]
+    if (!this.hasMarkdown(segments)) {
+      const MEDIA = ["image", "audio", "video", "file"]
+      const groups = []
+      for (const seg of segments) {
+        const type = seg?.type
+        const last = groups[groups.length - 1]
+        if (MEDIA.includes(type)) {
+          if (last?.media) last.media.push(seg)
+          else groups.push({ media: [seg] })
+        } else {
+          if (last?.media) groups.push({ rest: [seg] })
+          else if (last) last.rest.push(seg)
+          else groups.push({ rest: [seg] })
+        }
+      }
+      if (groups.length > 1 || (groups.length === 1 && groups[0].media)) {
+        for (const group of groups) {
+          if (group.rest)
+            await this.sendMessage(bot, data, group.rest)
+          for (const seg of group.media || []) {
+            const msgParam = await this.makeMediaParam(entry.config, seg)
+            const msgKey = { image: "sampleImageMsg", audio: "sampleAudio", video: "sampleVideo", file: "sampleFile" }[seg.type]
+            await this.sendRobotMessage(entry.config, data, msgKey, JSON.stringify(msgParam))
+          }
+        }
+        const target = data.group_id ? `群消息：[${data.group_id}]` : `好友消息：[${data.user_id || "unknown"}]`
+        Bot.makeLog("info", [target, `[分段:${groups.length}组]`], this.logId(bot.self_id))
+        bot.stat.message_sent = (bot.stat.message_sent || 0) + 1
+        return { message_id: `${bot.self_id}_${Date.now().toString(36)}` }
+      }
+    }
+    // 仅媒体段：走接口方式发送
     const media = this.pickMedia(message)
     if (media?.length) {
       for (const segment of media) {
