@@ -850,12 +850,13 @@ const adapter = new (class DingTalkAdapter {
       if (!item || typeof item !== "object" || typeof item.text !== "string") return null
       const title = item.text.trim()
       if (!title) return null
+      const style = item.style
       if (typeof item.link === "string") {
         const link = item.link.replace(/`/g, "")
-        return /^https?:\/\//i.test(link) ? { title, actionURL: link } : null
+        return /^https?:\/\//i.test(link) ? { title, actionURL: link, style } : null
       }
-      if (typeof item.callback === "string") return { title, actionURL: "", callback: item.callback }
-      if (typeof item.input === "string") return { title, actionURL: "", input: item.input }
+      if (typeof item.callback === "string") return { title, actionURL: "", callback: item.callback, style }
+      if (typeof item.input === "string") return { title, actionURL: "", input: item.input, style }
       return null
     }
     const visit = item => {
@@ -864,9 +865,13 @@ const adapter = new (class DingTalkAdapter {
       if (typeof item !== "object") return
       if (item.type === "node") return (item.data || []).forEach(node => visit(node.message || node))
       if (item.type === "button" && Array.isArray(item.data)) {
-        // 二维数组：每个子数组一行；一维数组：整体作为一行
-        for (const line of Array.isArray(item.data[0]) ? item.data : [item.data]) {
-          const row = (line || []).map(makeButton).filter(Boolean)
+        // oicq button(...data) 为 rest 参数：data = [用户传入的数组]，一维按钮列表或二维行数组会多包一层
+        // 逐层剥开外层数组包装：仅当内部仍是「行数组」（元素为数组）才继续剥
+        let lines = item.data
+        while (lines.length === 1 && Array.isArray(lines[0]) && Array.isArray(lines[0][0]))
+          lines = lines[0]
+        for (const line of lines) {
+          const row = (Array.isArray(line) ? line : [line]).map(makeButton).filter(Boolean)
           if (row.length) rows.push(row)
         }
         return
@@ -875,6 +880,12 @@ const adapter = new (class DingTalkAdapter {
     }
     visit(message)
     return rows
+  }
+
+  // Yunzai 按钮样式 → 钉钉卡片按钮颜色（合法值 blue/blue_filled/gray/red/gold）：
+  // 0灰色线框→gray 1蓝色线框→blue 2特殊样式→gold 3红色文字→red 4白色填充→blue_filled，其余回退 blue
+  buttonColor(style) {
+    return ["gray", "blue", "gold", "red", "blue_filled"][Number(style)] || "blue"
   }
 
   // 是否携带 markdown 消息段（含 node 内层）：携带时整条按 Markdown 消息发送
@@ -971,7 +982,7 @@ const adapter = new (class DingTalkAdapter {
       let actionIndex = 0
       const toCardButton = button => ({
         text: button.title,
-        color: "blue",
+        color: this.buttonColor(button.style),
         status: "normal",
         event: button.actionURL
           ? { type: "openLink", params: { url: button.actionURL } }

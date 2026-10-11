@@ -58,7 +58,7 @@ git clone --depth=1 https://github.com/lylncode/DingTalk-Plugin.git ./plugins/Di
 3. 按钮规则：
    - 链接按钮：点击跳转 `actionURL`
    - `callback` / `input` 按钮：点击后内容作为消息触发插件指令处理，回复返回原会话
-4. 按钮最多 5 行
+4. 按钮最多 5 行；按钮颜色按 `style` 自动映射：`0` 黑灰、`1` 蓝色线框、`2` 金色、`3` 红灰、`4` 实底蓝色，缺省蓝色线框
 5. 卡片点击回调经 Stream 通道接收，无需配置回调地址
 
 ## 图片与图床
