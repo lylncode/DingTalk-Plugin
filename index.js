@@ -1,6 +1,11 @@
 logger.info(logger.yellow("- 正在加载 DingTalk 适配器插件"))
 
 import { readFileSync } from "fs"
+import { readFile, writeFile, rm } from "fs/promises"
+import { randomUUID } from "node:crypto"
+import { spawn } from "child_process"
+import { tmpdir } from "os"
+import path from "path"
 import { WebSocket } from "ws"
 import makeConfig from "../../lib/plugins/config.js"
 import chokidar from "chokidar"
@@ -14,6 +19,10 @@ const { config, configSave, configFile } = await makeConfig(
   {
     tips: "",
     permission: "master",
+    // 全局 Markdown 开关：开启后普通文本消息也按 Markdown 消息发送，关闭则发纯文本（Markdown 段始终按 Markdown 发送）
+    markdown: true,
+    // 互动卡片模板 ID：配置后文本/Markdown 消息走互动卡片投放（万能模板：md 正文 + 任意数量按钮 + Stream 回调）
+    cardTemplateId: "",
     // 媒体上传策略（保留字段，图片经图床/本地转 URL 发送）
     uploadStrategy: "public-url",
     dingdingAccounts: [],
@@ -43,6 +52,8 @@ const adapter = new (class DingTalkAdapter {
     this.groupRobotErrors = new Map()
     // 收到的消息内容缓存（msgId -> 文本，上限 200 条）：供 reply 段渲染引用
     this.messageCache = new Map()
+    // 互动卡片场域映射（outTrackId -> { group_id, user_id }）：卡片回调据此刻别群/单聊，避免依赖 gl 时序
+    this.cardSpaces = new Map()
   }
 
   // bot self_id：钉钉 platformId（chatbotUserId）学习后写回配置，未学习前用账号标识
@@ -99,7 +110,11 @@ const adapter = new (class DingTalkAdapter {
       body: JSON.stringify({
         clientId: account.clientId,
         clientSecret: account.clientSecret,
-        subscriptions: [{ type: "CALLBACK", topic: "/v1.0/im/bot/messages/get" }],
+        subscriptions: [
+          { type: "CALLBACK", topic: "/v1.0/im/bot/messages/get" },
+          // 互动卡片按钮回调（callbackType=STREAM 时经此 topic 推送）
+          { type: "CALLBACK", topic: "/v1.0/card/instances/callback" },
+        ],
       }),
     })
     const data = await response.json()
@@ -372,6 +387,16 @@ const adapter = new (class DingTalkAdapter {
       pickMember: (group_id, user_id) => this.pickMember(bot, group_id, user_id),
       // 创建内部群，返回 group_id（openConversationId）：{ name, owner, members } 均为 userId
       createGroup: options => this.createGroup(account, options),
+      // 互动卡片 API：完全走开放接口操作卡片实例
+      createCard: body => this.createCard(account, body),
+      createAndDeliverCard: body => this.createAndDeliverCard(account, body),
+      deliverCard: body => this.deliverCard(account, body),
+      updateCard: body => this.updateCard(account, body),
+      closeCardTop: (outTrackId, openConversationId) => this.closeCardTop(account, outTrackId, openConversationId),
+      streamingUpdateCard: options => this.streamingUpdateCard(account, options),
+      registerCardCallback: options => this.registerCardCallback(account, options),
+      appendCardSpaces: body => this.appendCardSpaces(account, body),
+      copyCardTemplate: templateId => this.copyCardTemplate(account, templateId),
     }
     Bot[self_id] = bot
     Bot.bots[self_id] = bot
@@ -465,21 +490,21 @@ const adapter = new (class DingTalkAdapter {
     return url || await Bot.fileToUrl(file)
   }
 
-  // 仅含 image/audio/video/file 段的顶层消息返回段数组（webhook 不支持这些类型，改走接口方式），否则 null
+  // 仅含 image/audio/record/video/file 段的顶层消息返回段数组（webhook 不支持这些类型，改走接口方式），否则 null
   pickMedia(message) {
     const segments = Array.isArray(message) ? message : [message]
     const out = []
     for (let segment of segments) {
       if (segment === null || segment === undefined) continue
       if (typeof segment !== "object") return null
-      if (!["image", "audio", "video", "file"].includes(segment.type)) return null
+      if (!["image", "audio", "record", "music", "video", "file"].includes(segment.type)) return null
       out.push({ ...segment, data: segment.data || segment })
     }
     return out
   }
 
   // 上传媒体文件获取 media_id（type: image/voice/video/file，media_id 可复用，photoURL 等参数可直接填 mediaId）
-  // 限制：image 20MB（jpg/gif/png/bmp），voice 2MB（amr/mp3/wav），video 20MB（mp4），file 20MB
+  // 限制：image 20MB（jpg/gif/png/bmp），video 20MB（mp4），file 20MB；voice 仅接受 amr，非 amr 语音先经 ffmpeg 转码
   async uploadMedia(account, type, file) {
     let buffer = file.buffer || file.file
     if (!Buffer.isBuffer(buffer)) buffer = Buffer.from(await (await fetch(file.url)).arrayBuffer())
@@ -496,6 +521,69 @@ const adapter = new (class DingTalkAdapter {
     return data.media_id
   }
 
+  // 执行外部命令，返回 stdout；退出码非 0 时抛错
+  runCmd(cmd, args) {
+    return new Promise((resolve, reject) => {
+      const child = spawn(cmd, args)
+      let stdout = ""
+      child.stdout.on("data", chunk => (stdout += chunk))
+      child.on("error", reject)
+      child.on("exit", code => (code ? reject(new Error(`${cmd} 退出码 ${code}`)) : resolve(stdout)))
+    })
+  }
+
+  // 转码为 amr（钉钉 voice 上传仅接受 amr），返回 { name, buffer, duration(秒) }
+  // silk 语音（shareMusic 等插件产出）ffmpeg 无法解码，先经 silk-wasm 解码为 pcm 再转
+  async convertAmr(file) {
+    const input = path.join(tmpdir(), `dingtalk-${Date.now()}`)
+    const output = `${input}.amr`
+    let buffer = file.buffer
+    // silk 数据头部自带 0x02 前缀（silk-wasm 编码/QQ 语音均如此），decode 需保留原样传入
+    if (buffer.subarray(0, 10).toString().includes("#!SILK")) {
+      const { decode } = await import("silk-wasm")
+      buffer = (await decode(buffer, 24000)).data
+      await writeFile(input, buffer)
+      await this.runCmd("ffmpeg", ["-y", "-f", "s16le", "-ar", "24000", "-ac", "1", "-i", input, "-ar", "8000", "-ac", "1", "-ab", "12.2k", output])
+    } else {
+      await writeFile(input, buffer)
+      await this.runCmd("ffmpeg", ["-y", "-i", input, "-ar", "8000", "-ac", "1", "-ab", "12.2k", output])
+    }
+    try {
+      const duration = Number(await this.runCmd("ffprobe", ["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", output])) || 0
+      return {
+        name: `${String(file.name || "audio").replace(/\.\w+$/, "")}.amr`,
+        type: { ext: "amr" },
+        buffer: await readFile(output),
+        duration,
+      }
+    } finally {
+      rm(input, { force: true }).catch(() => {})
+      rm(output, { force: true }).catch(() => {})
+    }
+  }
+
+  // ffprobe 探测本地视频文件 duration(秒)/width/height，失败抛错由调用方降级
+  async probeVideo(input) {
+    const json = JSON.parse(await this.runCmd("ffprobe", ["-v", "error", "-print_format", "json", "-show_streams", "-show_format", input]))
+    const stream = json.streams?.find(item => item.codec_type === "video")
+    return {
+      duration: Number(json.format?.duration || stream?.duration) || 0,
+      width: stream?.width,
+      height: stream?.height,
+    }
+  }
+
+  // ffmpeg 抽取视频首帧为 jpg 封面，失败抛错由调用方降级
+  async extractPoster(input) {
+    const output = `${input}-poster.jpg`
+    try {
+      await this.runCmd("ffmpeg", ["-y", "-i", input, "-frames:v", "1", "-q:v", "2", output])
+      return { name: "poster.jpg", buffer: await readFile(output) }
+    } finally {
+      rm(output, { force: true }).catch(() => {})
+    }
+  }
+
   // 媒体段 → 接口方式 msgParam：统一上传 mediaId（本地/网页/base64/dataURL 源由 Bot.fileType 统一处理）
   // 兼容两种段结构：{ type, data } 与 oicq 平铺 { type, file, name }
   async makeMediaParam(account, segment) {
@@ -505,17 +593,76 @@ const adapter = new (class DingTalkAdapter {
         const file = await Bot.fileType(data, { http: true })
         return { photoURL: await this.uploadMedia(account, "image", file) }
       }
-      case "audio": {
+      case "audio":
+      case "record": {
+        // 钉钉 voice 上传仅接受 amr：有 ffmpeg 时转码为 amr 走语音气泡，失败降级为文件附件发送
+        // http:true 时 Bot.fileType 的 buffer 可能是 URL 字符串，转码前统一取真实 Buffer
         const file = await Bot.fileType(data, { http: true })
-        return { mediaId: await this.uploadMedia(account, "voice", file), duration: String(data.duration || 1000) }
+        if (!Buffer.isBuffer(file.buffer)) file.buffer = Buffer.from(await (await fetch(file.url)).arrayBuffer())
+        try {
+          const amr = file.type?.ext === "amr" ? file : await this.convertAmr(file)
+          const duration = Number(data.duration || amr.duration || 0)
+          return { mediaId: await this.uploadMedia(account, "voice", amr), duration: String(Math.round(duration * 1000)) }
+        } catch (error) {
+          this.log("debug", account.accountId, "语音转码失败，降级为文件附件发送", error)
+          const name = data.name || file.name || "audio.mp3"
+          return {
+            mediaId: await this.uploadMedia(account, "file", file),
+            fileName: name,
+            fileType: name.split(".").pop() || "mp3",
+          }
+        }
       }
       case "video": {
+        // 官方参数：videoMediaId / videoType(仅 mp4) / duration(秒) / picMediaId(封面) / height / width(px)
+        // http:true 时 Bot.fileType 的 buffer 可能是 URL 字符串，统一取真实 Buffer
         const file = await Bot.fileType(data, { http: true })
-        // duration 单位秒；videoType 官方仅支持 mp4
+        let buffer = file.buffer
+        if (!Buffer.isBuffer(buffer)) buffer = Buffer.from(await (await fetch(file.url || buffer)).arrayBuffer())
+        // 写入临时文件供 ffprobe 探测与 ffmpeg 抽帧，用完清理
+        const input = path.join(tmpdir(), `dingtalk-video-${Date.now()}`)
+        await writeFile(input, buffer)
+        try {
+          const probe = await this.probeVideo(input).catch(() => ({}))
+          const param = {
+            videoMediaId: await this.uploadMedia(account, "video", { name: file.name, buffer }),
+            videoType: "mp4",
+            duration: String(Math.round(Number(data.duration || probe.duration || 0))),
+          }
+          if (probe.height) param.height = probe.height
+          if (probe.width) param.width = probe.width
+          // 封面：段携带 pic/cover 优先，否则抽取视频首帧
+          const pic = data.pic || data.cover || data.thumb
+          if (pic) {
+            try {
+              const cover = await Bot.fileType({ file: String(pic).replaceAll("`", "") }, { http: true })
+              param.picMediaId = await this.uploadMedia(account, "image", cover)
+            } catch {}
+          } else {
+            const poster = await this.extractPoster(input).catch(() => null)
+            if (poster) param.picMediaId = await this.uploadMedia(account, "image", poster)
+          }
+          return param
+        } finally {
+          rm(input, { force: true }).catch(() => {})
+        }
+      }
+      case "music": {
+        // 音乐分享卡 → sampleLink：标题 + 简介 + 封面（上传 media_id）+ 跳转地址
+        const card = segment.data || segment
+        let picUrl = ""
+        if (card.image) {
+          try {
+            const cover = await Bot.fileType({ file: String(card.image).replaceAll("`", "") }, { http: true })
+            picUrl = await this.uploadMedia(account, "image", cover)
+          } catch {}
+        }
+        const title = card.title || "音乐分享"
         return {
-          videoMediaId: await this.uploadMedia(account, "video", file),
-          videoType: "mp4",
-          duration: String(Math.round(data.duration || 0)),
+          text: card.content ? `${title} - ${card.content}` : title,
+          title,
+          picUrl,
+          messageUrl: String(card.url || card.audio || "").replaceAll("`", ""),
         }
       }
       case "file": {
@@ -549,6 +696,71 @@ const adapter = new (class DingTalkAdapter {
     if (!response.ok || result.code)
       throw new Error(`DingTalk 媒体发送失败: ${Bot.String(result)}`)
     return result
+  }
+
+  // ===== 互动卡片 API（完全走开放接口操作卡片实例）=====
+
+  // 互动卡片接口统一请求：失败时抛出含响应体的错误
+  async cardRequest(account, method, path, params = {}) {
+    const query = params.query ? `?${new URLSearchParams(params.query)}` : ""
+    const response = await fetch(`https://api.dingtalk.com${path}${query}`, {
+      method,
+      headers: { "content-type": "application/json", "x-acs-dingtalk-access-token": account.accessToken },
+      body: params.body ? JSON.stringify(params.body) : undefined,
+    })
+    const result = await response.json().catch(() => ({}))
+    if (!response.ok || result.success === false)
+      throw new Error(`DingTalk 卡片接口 ${path} 失败: ${Bot.String(result)}`)
+    return result
+  }
+
+  // 创建卡片（仅创建不投放）：body 含 cardTemplateId/outTrackId/cardData/privateData/openSpaceModels 等
+  createCard(account, body) {
+    return this.cardRequest(account, "POST", "/v1.0/card/instances", { body })
+  }
+
+  // 创建并投放卡片：openSpaceId 格式 dtv1.card//IM_GROUP.{openConversationId}（群）或 dtv1.card//IM_ROBOT.{userId}（机器人单聊）
+  createAndDeliverCard(account, body) {
+    return this.cardRequest(account, "POST", "/v1.0/card/instances/createAndDeliver", { body })
+  }
+
+  // 投放已创建的卡片实例：openSpaceId 支持分号分隔多场域，openDeliverModel 携带各场域差异化属性（如 robotCode）
+  deliverCard(account, body) {
+    return this.cardRequest(account, "POST", "/v1.0/card/instances/deliver", { body })
+  }
+
+  // 更新卡片数据：cardData/privateData 全量覆盖，cardUpdateOptions.updateCardDataByKey=true 按 key 更新
+  updateCard(account, body) {
+    return this.cardRequest(account, "PUT", "/v1.0/card/instances", { body })
+  }
+
+  // 关闭吊顶卡片：query 传 outTrackId + openConversationId
+  closeCardTop(account, outTrackId, openConversationId) {
+    return this.cardRequest(account, "POST", "/v1.0/card/tops/close", { query: { outTrackId, openConversationId } })
+  }
+
+  // AI 卡片流式更新（打字机效果）：markdown 变量必须 isFull=true 且全量内容，单次 content ≤1KB
+  streamingUpdateCard(account, { outTrackId, key, content, isFull = true, isFinalize = false, isError = false }) {
+    return this.cardRequest(account, "PUT", "/v1.0/card/streaming", {
+      body: { outTrackId, key, content, guid: randomUUID(), isFull, isFinalize, isError },
+    })
+  }
+
+  // 注册卡片回调地址（HTTP 回调模式用；callbackType=STREAM 时无需注册）
+  registerCardCallback(account, { callbackRouteKey, callbackUrl, apiSecret, forceUpdate }) {
+    return this.cardRequest(account, "POST", "/v1.0/card/callbacks/register", {
+      body: { callbackRouteKey, callbackUrl, apiSecret, forceUpdate },
+    })
+  }
+
+  // 新增或更新卡片实例的场域信息，使已创建的卡片可投放到对应场域
+  appendCardSpaces(account, body) {
+    return this.cardRequest(account, "PUT", "/v1.0/card/instances/spaces", { body })
+  }
+
+  // 卡片平台模板复制：根据 templateId 复制模板（官方标注仅第三方企业应用支持）
+  copyCardTemplate(account, templateId) {
+    return this.cardRequest(account, "POST", "/v1.0/card/templates/copy", { body: { templateId } })
   }
 
   // 消息段 → 钉钉消息正文：默认纯文本（plain=false 时用 Markdown 语法），
@@ -594,15 +806,18 @@ const adapter = new (class DingTalkAdapter {
           break
         case "button":
           break
+        case "music": {
+          // 音乐分享卡片：钉钉无原生音乐消息，降级为链接消息（sampleLink），仅媒体段独立发送时生效
+          break
+        }
         default:
-          out.push(data.text || Bot.String(segment))
+          out.push(data.text || segment.type || "")
       }
     }
     return out.join("")
   }
 
-  // 递归收集 http 跳转按钮（含 node 内层）：兼容任意嵌套深度与被反引号包裹的 URL，
-  // 叶子按钮为 { text, link }，转 ActionCard 发送
+  // 提取按钮：link 按钮转跳转按钮；callback/input 按钮钉钉无点击能力，actionURL 传空仅展示
   getActionButtons(message) {
     const buttons = []
     const visit = item => {
@@ -610,15 +825,56 @@ const adapter = new (class DingTalkAdapter {
       if (Array.isArray(item)) return item.forEach(visit)
       if (typeof item !== "object") return
       if (item.type === "node") return (item.data || []).forEach(node => visit(node.message || node))
-      if (typeof item.text === "string" && typeof item.link === "string") {
-        const link = item.link.replace(/`/g, "")
-        if (/^https?:\/\//i.test(link)) buttons.push({ title: item.text, actionURL: link })
+      if (typeof item.text === "string") {
+        const title = item.text.trim()
+        if (!title) return
+        if (typeof item.link === "string") {
+          const link = item.link.replace(/`/g, "")
+          if (/^https?:\/\//i.test(link)) buttons.push({ title, actionURL: link })
+          return
+        }
+        if (typeof item.callback === "string" || typeof item.input === "string")
+          buttons.push({ title, actionURL: "" })
         return
       }
       visit(item.data ?? item.button ?? item.buttons)
     }
     visit(message)
     return buttons
+  }
+
+  // 提取按钮行结构：Yunzai 按钮段二维数组的每个子数组即一行，保留行划分供互动卡片按行渲染
+  getActionButtonRows(message) {
+    const rows = []
+    const makeButton = item => {
+      if (!item || typeof item !== "object" || typeof item.text !== "string") return null
+      const title = item.text.trim()
+      if (!title) return null
+      if (typeof item.link === "string") {
+        const link = item.link.replace(/`/g, "")
+        return /^https?:\/\//i.test(link) ? { title, actionURL: link } : null
+      }
+      if (typeof item.callback === "string") return { title, actionURL: "", callback: item.callback }
+      if (typeof item.input === "string") return { title, actionURL: "", input: item.input }
+      return null
+    }
+    const visit = item => {
+      if (!item) return
+      if (Array.isArray(item)) return item.forEach(visit)
+      if (typeof item !== "object") return
+      if (item.type === "node") return (item.data || []).forEach(node => visit(node.message || node))
+      if (item.type === "button" && Array.isArray(item.data)) {
+        // 二维数组：每个子数组一行；一维数组：整体作为一行
+        for (const line of Array.isArray(item.data[0]) ? item.data : [item.data]) {
+          const row = (line || []).map(makeButton).filter(Boolean)
+          if (row.length) rows.push(row)
+        }
+        return
+      }
+      visit(item.data ?? item.button ?? item.buttons)
+    }
+    visit(message)
+    return rows
   }
 
   // 是否携带 markdown 消息段（含 node 内层）：携带时整条按 Markdown 消息发送
@@ -635,6 +891,16 @@ const adapter = new (class DingTalkAdapter {
     return found
   }
 
+  // 发送媒体段：转换接口参数后按类型映射 msgKey，语音转码成功（无 fileName）走语音气泡 sampleAudio
+  async sendMedia(config, data, segment) {
+    const msgParam = await this.makeMediaParam(config, segment)
+    const msgKey =
+      (segment.type === "audio" || segment.type === "record") && !msgParam.fileName
+        ? "sampleAudio"
+        : { image: "sampleImageMsg", audio: "sampleFile", record: "sampleFile", music: "sampleLink", video: "sampleVideo", file: "sampleFile" }[segment.type]
+    await this.sendRobotMessage(config, data, msgKey, JSON.stringify(msgParam))
+  }
+
   // 发送消息：默认纯文本，携带 markdown 段时整条按 Markdown 发送；提取到按钮时改发 ActionCard（最多 5 个）
   // 回复事件携带 sessionWebhook 优先使用，否则回退账号配置的默认 webhook
   async sendMessage(bot, data, message) {
@@ -643,12 +909,15 @@ const adapter = new (class DingTalkAdapter {
       this.log("error", bot.self_id, "bot 未注册或已断开，无法发送消息")
       return false
     }
+    // Markdown 模式判定：携带 markdown 段或全局 Markdown 开关开启（对齐 QQBot md 模式）——
+    // 整条渲染为 Markdown 消息，图片内嵌为公网 URL，不做分段
+    const segments = Array.isArray(message) ? [...message] : [message]
+    const markdown = config.markdown || this.hasMarkdown(segments)
     // 消息分段发送：钉钉单条消息无法图文混排原生图片，按段顺序拆组——
     // 连续媒体段（image/audio/video/file）一组走接口方式，其余段合并一组走 Webhook；
-    // 携带 markdown 段时图片内嵌为公网 URL，保持整条一条消息
-    const segments = Array.isArray(message) ? [...message] : [message]
-    if (!this.hasMarkdown(segments)) {
-      const MEDIA = ["image", "audio", "video", "file"]
+    // Markdown 模式时不分段
+    if (!markdown) {
+      const MEDIA = ["image", "audio", "record", "music", "video", "file"]
       const groups = []
       for (const seg of segments) {
         const type = seg?.type
@@ -666,11 +935,7 @@ const adapter = new (class DingTalkAdapter {
         for (const group of groups) {
           if (group.rest)
             await this.sendMessage(bot, data, group.rest)
-          for (const seg of group.media || []) {
-            const msgParam = await this.makeMediaParam(entry.config, seg)
-            const msgKey = { image: "sampleImageMsg", audio: "sampleAudio", video: "sampleVideo", file: "sampleFile" }[seg.type]
-            await this.sendRobotMessage(entry.config, data, msgKey, JSON.stringify(msgParam))
-          }
+          for (const seg of group.media || []) await this.sendMedia(entry.config, data, seg)
         }
         const target = data.group_id ? `群消息：[${data.group_id}]` : `好友消息：[${data.user_id || "unknown"}]`
         Bot.makeLog("info", [target, `[分段:${groups.length}组]`], this.logId(bot.self_id))
@@ -678,49 +943,123 @@ const adapter = new (class DingTalkAdapter {
         return { message_id: `${bot.self_id}_${Date.now().toString(36)}` }
       }
     }
-    // 仅媒体段：走接口方式发送
-    const media = this.pickMedia(message)
+    // 仅媒体段：走接口方式发送；Markdown 模式下图片由正文内嵌渲染（imageToUrl 图床直链），仅其余媒体走接口
+    const media = this.pickMedia(markdown ? segments.filter(segment => segment?.type !== "image") : message)
     if (media?.length) {
-      for (const segment of media) {
-        const msgParam = await this.makeMediaParam(entry.config, segment)
-        const msgKey = { image: "sampleImageMsg", audio: "sampleAudio", video: "sampleVideo", file: "sampleFile" }[segment.type]
-        await this.sendRobotMessage(entry.config, data, msgKey, JSON.stringify(msgParam))
-      }
+      for (const segment of media) await this.sendMedia(entry.config, data, segment)
       const target = data.group_id ? `群消息：[${data.group_id}]` : `好友消息：[${data.user_id || "unknown"}]`
       Bot.makeLog("info", [target, `[媒体:${media.length}条]`], this.logId(bot.self_id))
       bot.stat.message_sent = (bot.stat.message_sent || 0) + 1
       return { message_id: `${bot.self_id}_${Date.now().toString(36)}` }
     }
+    // 回调触发的模拟消息没有 sessionWebhook：卡片走卡片接口、按钮/正文走机器人消息接口，不在此报错
     const webhook = data.sessionWebhook || entry?.config?.webhook
-    if (!webhook) {
-      this.log("error", bot.self_id, "消息缺少 sessionWebhook，且账号未配置 webhook")
-      return false
-    }
-    const markdown = this.hasMarkdown(message)
     const text = (await this.renderMessage(message, !markdown)).trim()
     const buttons = this.getActionButtons(message)
     Bot.makeLog("debug", ["markdown 段:", markdown, "按钮:", buttons.length, buttons], this.logId(bot.self_id))
     if (!text && !buttons.length) return false
-    if (buttons.length > 5)
-      this.log("warn", bot.self_id, "钉钉 ActionCard 最多支持 5 个跳转按钮，已截取前 5 个")
-    const cardButtons = buttons.slice(0, 5)
-    // Webhook 方式的 ActionCard 参数：btns 数组（接口方式的 actionTitleN 平铺字段此处不生效）；
-    // text 服务端强制非空（空格也会被 trim 判空），纯按钮时用不间断空格实体兜底，渲染后不可见
-    const actionCard = {
-      title: bot.nickname || "DingTalk",
-      text: text || "&nbsp;",
-      btnOrientation: "0",
-      btns: cardButtons,
+    // 互动卡片模式：配置 cardTemplateId 后正文与按钮合并为一张互动卡片投放，
+    // 按钮数量不限：link → openLink 事件，callback/input → sendCardRequest 回传事件（Stream 回调接收）
+    if (config.cardTemplateId) {
+      const outTrackId = `yz_${Date.now().toString(36)}_${randomUUID().replace(/-/g, "").slice(0, 12)}`
+      const robotCode = entry.config.robotCode || entry.config.clientId
+      // 卡片按行渲染按钮：Yunzai 按钮段二维数组每个子数组一行，模板提供 row1~row5 五个按钮组
+      const rows = this.getActionButtonRows(message)
+      if (rows.length > 5)
+        this.log("warn", bot.self_id, "钉钉互动卡片最多渲染 5 行按钮，多余行已合并至末行")
+      const cardRows = [...rows.slice(0, 4), ...(rows.length > 4 ? [rows.slice(4).flat()] : [])]
+      let actionIndex = 0
+      const toCardButton = button => ({
+        text: button.title,
+        color: "blue",
+        status: "normal",
+        event: button.actionURL
+          ? { type: "openLink", params: { url: button.actionURL } }
+          : {
+              type: "sendCardRequest",
+              params: { actionId: `action_${actionIndex++}`, params: { action: button.callback || button.input || "" } },
+            },
+      })
+      const [row1, row2, row3, row4, row5] = [0, 1, 2, 3, 4].map(i => (cardRows[i] || []).map(toCardButton))
+      const body = {
+        cardTemplateId: config.cardTemplateId,
+        outTrackId,
+        // 卡片创建者 userId
+        userId: data.dingtalk_event?.senderStaffId || data.user_id || undefined,
+        callbackType: "STREAM",
+        userIdType: 1,
+        cardData: {
+          cardParamMap: {
+            content: text || "&nbsp;",
+            // 复杂类型（对象数组）变量必须放入 sys_full_json_obj，简单字符串放 cardParamMap 顶层
+            sys_full_json_obj: JSON.stringify({ config: { autoLayout: true }, row1, row2, row3, row4, row5 }),
+          },
+        },
+        // openSpaceId 场域标识用小写；场域属性与投放参数为顶层字段（官方 SDK 示例）
+        openSpaceId: data.group_id
+          ? `dtv1.card//im_group.${data.group_id}`
+          : `dtv1.card//im_robot.${data.dingtalk_event?.senderStaffId || data.user_id}`,
+        ...(data.group_id
+          ? {
+              imGroupOpenSpaceModel: { supportForward: true, lastMessageI18n: { ZH_CN: this.cardSummary(text) } },
+              imGroupOpenDeliverModel: { robotCode },
+            }
+          : {
+              imRobotOpenSpaceModel: { supportForward: true, lastMessageI18n: { ZH_CN: this.cardSummary(text) } },
+              imRobotOpenDeliverModel: { spaceType: "IM_ROBOT", robotCode },
+            }),
+      }
+      await this.createAndDeliverCard(entry.config, body)
+      // 记录卡片场域映射，回调点击时据此刻别群/单聊
+      this.setCache(this.cardSpaces, outTrackId, {
+        group_id: data.group_id || "",
+        user_id: String(body.userId || data.user_id || ""),
+      })
+      const target = data.group_id ? `群消息：[${data.group_id}]` : `好友消息：[${data.user_id || "unknown"}]`
+      const count = cardRows.reduce((sum, row) => sum + row.length, 0)
+      Bot.makeLog("info", [target, `[互动卡片:${cardRows.length}行${count}按钮] ${text}`], this.logId(bot.self_id))
+      bot.stat.message_sent = (bot.stat.message_sent || 0) + 1
+      return { message_id: outTrackId }
     }
-    const payload = cardButtons.length
-      ? { msgtype: "actionCard", actionCard }
-      : markdown
-        ? { msgtype: "markdown", markdown: { title: bot.nickname || "DingTalk", text } }
-        : { msgtype: "text", text: { content: text } }
-    await this.postWebhook(webhook, payload)
+    // 按钮：接口方式按数量选 msgKey——1个 sampleActionCard（singleTitle/singleURL），
+    // 2~5个 sampleActionCard2~5（actionTitleN/actionURLN 竖向排布），各 msgKey 字段布局互不兼容
+    if (buttons.length) {
+      if (buttons.length > 5)
+        this.log("warn", bot.self_id, "钉钉 ActionCard 最多支持 5 个按钮，已截取前 5 个")
+      const cardButtons = buttons.slice(0, 5)
+      const msgParam = { title: bot.nickname || "DingTalk", text: text || "&nbsp;" }
+      let msgKey
+      if (cardButtons.length === 1) {
+        msgKey = "sampleActionCard"
+        msgParam.singleTitle = cardButtons[0].title
+        msgParam.singleURL = cardButtons[0].actionURL
+      } else {
+        msgKey = `sampleActionCard${cardButtons.length}`
+        cardButtons.forEach((button, index) => {
+          msgParam[`actionTitle${index + 1}`] = button.title
+          msgParam[`actionURL${index + 1}`] = button.actionURL
+        })
+      }
+      await this.sendRobotMessage(entry.config, data, msgKey, JSON.stringify(msgParam))
+      const target = data.group_id ? `群消息：[${data.group_id}]` : `好友消息：[${data.user_id || "unknown"}]`
+      Bot.makeLog("info", [target, `[ActionCard:${cardButtons.length}按钮] ${text}`], this.logId(bot.self_id))
+      bot.stat.message_sent = (bot.stat.message_sent || 0) + 1
+      return { message_id: `${bot.self_id}_${Date.now().toString(36)}` }
+    }
+    const payload = markdown
+      ? { msgtype: "markdown", markdown: { title: bot.nickname || "DingTalk", text } }
+      : { msgtype: "text", text: { content: text } }
+    if (webhook) await this.postWebhook(webhook, payload)
+    else
+      // 无 webhook（如卡片回调触发的模拟消息）时回退机器人消息接口
+      await this.sendRobotMessage(
+        entry.config,
+        data,
+        markdown ? "sampleMarkdown" : "sampleText",
+        JSON.stringify(markdown ? { title: bot.nickname || "DingTalk", text } : { content: text }),
+      )
     const target = data.group_id ? `群消息：[${data.group_id}]` : `好友消息：[${data.user_id || "unknown"}]`
-    const brief = cardButtons.length ? `[ActionCard:${cardButtons.length}按钮] ${text}` : text
-    Bot.makeLog("info", [target, brief], this.logId(bot.self_id))
+    Bot.makeLog("info", [target, text], this.logId(bot.self_id))
     bot.stat.message_sent = (bot.stat.message_sent || 0) + 1
     return { message_id: `${bot.self_id}_${Date.now().toString(36)}` }
   }
@@ -851,6 +1190,72 @@ const adapter = new (class DingTalkAdapter {
     return data
   }
 
+  // 卡片外显摘要：从正文提取纯文本（图片→[图片]，去 Markdown 语法与多余空白），截断 30 字
+  cardSummary(text) {
+    const summary = String(text || "")
+      .replace(/!\[[^\]]*\]\([^)]*\)/g, "[图片]")
+      .replace(/\[([^\]]*)\]\([^)]*\)/g, "$1")
+      .replace(/[#*`>~\-|]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 30)
+    return summary || "收到一条卡片消息"
+  }
+
+  // 卡片按钮点击回调：对齐 QQBot 适配器范式，构造按钮点击消息事件进入 Yunzai 管线，
+  // callback/input 按钮内容作为点击者的消息触发插件处理，回复经机器人消息接口返回
+  makeCardCallback(entry, body, action) {
+    const bot = entry.bot
+    const user_id = String(body.userId)
+    const spaceId = String(body.spaceId || "")
+    // 群/单聊判断优先查发送卡片时记录的场域映射（outTrackId -> { group_id, user_id }），
+    // bot.gl 依赖适配器收到过该群真实消息才填充，不可靠；未命中时才回退 gl 兜底
+    const space = this.getCache(this.cardSpaces, String(body.outTrackId || "")) || {}
+    const groupId = space.group_id || (bot.gl.has(spaceId) ? spaceId : "")
+    const isGroup = Boolean(groupId)
+    const data = {
+      bot,
+      adapter_id: this.id,
+      adapter_name: this.name,
+      post_type: "message",
+      message_type: isGroup ? "group" : "private",
+      // 预置 isGroup/isPrivate：避免 loader.checkLimit 在 dealEvent 前把无 group_id 的事件当群消息误入冷却拦截
+      isGroup,
+      isPrivate: !isGroup,
+      sub_type: "callback",
+      self_id: bot.self_id,
+      user_id: isGroup ? String(space.user_id || user_id) : user_id,
+      message_id: `event_${body.outTrackId || Date.now().toString(36)}`,
+      raw_message: action,
+      message: [{ type: "text", text: action }],
+      sender: { user_id, nickname: user_id, avatar: "", card: user_id, role: "member" },
+      nickname: user_id,
+      avatar: "",
+      time: Math.floor(Date.now() / 1000),
+      conversationId: spaceId,
+      dingtalk_event: body,
+      atme: true,
+    }
+    bot.fl.set(user_id, data.sender)
+    if (isGroup) {
+      data.group_id = groupId
+      data.group = this.pickGroup(bot, groupId, data)
+      Bot.makeLog("info", [`群按钮点击事件：[${groupId}, ${data.user_id}]`, action], bot.self_id)
+    } else {
+      data.friend = this.pickFriend(bot, user_id, data)
+      Bot.makeLog("info", [`好友按钮点击事件：[${user_id}]`, action], bot.self_id)
+    }
+    bot.stat.message_received = (bot.stat.message_received || 0) + 1
+    this.log(
+      "debug",
+      bot.self_id,
+      "回调事件派发:",
+      JSON.stringify({ event: `message.${data.message_type}`, user_id: data.user_id, message_type: data.message_type, sub_type: data.sub_type, raw_message: data.raw_message }),
+    )
+    // 与真实好友/群消息完全一致的事件名，确保进入同一处理管线
+    Bot.em(`message.${data.message_type}`, data)
+  }
+
   // Stream 推送分发：SYSTEM ping 原样回应保活；CALLBACK 学习 platformId、
   // 回填机器人资料、解码派发 Yunzai 消息事件，最后 ACK（不回应钉钉会重推）
   handleStreamMessage(entry, raw) {
@@ -864,6 +1269,28 @@ const adapter = new (class DingTalkAdapter {
             JSON.stringify({ code: 200, headers: envelope.headers, message: "OK", data: envelope.data }),
           )
         if (envelope.type !== "CALLBACK") return
+        // 互动卡片回调事件（callbackType=STREAM）：按钮点击/回传请求，透传给脚本监听
+        if (envelope.headers?.topic === "/v1.0/card/instances/callback") {
+          const body = typeof envelope.data === "string" ? JSON.parse(envelope.data) : envelope.data
+          this.log("debug", entry.bot.self_id, "卡片回调", Bot.String(body))
+          Bot.em(`notice.cardCallback.${entry.bot.self_id}`, { bot: entry.bot, ...body })
+          // 按钮回调自动处理：value/content 为 JSON 字符串，解析出回传指令后模拟点击用户的消息事件
+          const parseValue = value => {
+            try { return typeof value === "string" ? JSON.parse(value) : value } catch { return null }
+          }
+          const action = (parseValue(body.value) || parseValue(body.content))?.cardPrivateData?.params?.action
+          if (action) this.makeCardCallback(entry, body, action)
+          if (envelope.headers?.messageId)
+            entry.socket.send(
+              JSON.stringify({
+                code: 200,
+                headers: { ...envelope.headers, content_type: "application/json" },
+                message: "OK",
+                data: JSON.stringify({ status: "SUCCESS", message: "OK" }),
+              }),
+            )
+          return
+        }
         const body = typeof envelope.data === "string" ? JSON.parse(envelope.data) : envelope.data
         this.bindPlatformId(entry, body.chatbotUserId)
         await this.updateBotProfile(entry, body)

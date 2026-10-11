@@ -46,8 +46,20 @@ git clone --depth=1 https://github.com/lylncode/DingTalk-Plugin.git ./plugins/Di
 ## 消息支持
 
 - 收：文本、@、图片、文件、语音、视频、富文本
-- 发：纯文本、Markdown（`segment.markdown` 段）、按钮 ActionCard、图片 / 语音 / 视频 / 文件（接口方式，media_id 上传，本地 / 网页 / base64 / dataURL 源均可）
+- 发：纯文本、Markdown（`segment.markdown` 段）、按钮 ActionCard、互动卡片、图片 / 语音 / 视频 / 文件（接口方式，media_id 上传，本地 / 网页 / base64 / dataURL 源均可）
 - 引用回复：纯文本「回复：」前缀展示
+
+## 互动卡片
+
+配置全局 `cardTemplateId` 后，正文与按钮合并为一张互动卡片投放（正文 Markdown + 任意行按钮）：
+
+1. 在 [钉钉卡片平台](https://open-dev.dingtalk.com/fe/card) 导入插件附带的 [万能模板.json](万能模板.json) 并发布
+2. 将发布后的模板 ID（`xxxx.schema`）填入 `config/DingTalk.yaml` 的 `cardTemplateId`，支持锅巴配置、热重载
+3. 按钮规则：
+   - 链接按钮：点击跳转 `actionURL`
+   - `callback` / `input` 按钮：点击后内容作为消息触发插件指令处理，回复返回原会话
+4. 按钮最多 5 行
+5. 卡片点击回调经 Stream 通道接收，无需配置回调地址
 
 ## 图片与图床
 
@@ -65,6 +77,8 @@ git clone --depth=1 https://github.com/lylncode/DingTalk-Plugin.git ./plugins/Di
 配置文件 `config/DingTalk.yaml`：
 
 - `permission`：管理指令权限，默认 `master`
+- `markdown`：全局 Markdown 开关，默认开启，开启后普通文本也按 Markdown 消息发送
+- `cardTemplateId`：互动卡片模板 ID，配置后文本 / Markdown + 按钮消息走互动卡片投放，详见「互动卡片」
 - `dingdingAccounts`：账号列表，`#DingTalk设置` 命令或锅巴添加，每账号支持：
   - `clientId` / `clientSecret`：应用凭证（必填）
   - `webhook`：默认 Webhook，主动发送（无 sessionWebhook）时的回退地址
@@ -80,10 +94,10 @@ git clone --depth=1 https://github.com/lylncode/DingTalk-Plugin.git ./plugins/Di
 | 能力 | 权限点 | 说明 |
 | --- | --- | --- |
 | 消息收发 | 机器人能力 | 启用机器人 + Stream 模式即可，无需额外权限点 |
-| 群聊接口发送（媒体） | 机器人发送群聊消息 | 图片 / 语音 / 视频 / 文件走接口方式时需要 |
-| 单聊接口发送（媒体） | 机器人发送单聊消息 | 私聊发媒体时需要 |
+| 接口方式发送消息（群聊 / 单聊 / 媒体） | 企业内机器人发送消息权限（`qyapi_robot_sendmsg`） | 图片 / 语音 / 视频 / 文件走接口方式时需要 |
 | 媒体上传 | 调用企业 API 基础权限 | 默认具备 |
-| 用户昵称 / 头像补全 | 通讯录管理-成员信息读权限 | 未开通不影响消息处理，仅使用事件自带昵称 |
+| 互动卡片投放 / 更新 | 互动卡片实例写权限（`Card.Instance.Write`） | 配置 `cardTemplateId` 使用互动卡片时需要，无需审批，未开通时卡片发送失败 |
+| 用户昵称 / 头像补全 | 成员信息读权限（`qyapi_get_member`） | 未开通不影响消息处理，仅使用事件自带昵称 |
 | 群机器人资料回填 / 建群 / 改群名 / 拉人 | 钉钉群基础信息管理权限（`qyapi_chat_manage`） | 未开通时群管理相关能力不可用 |
 
 ## 平台说明

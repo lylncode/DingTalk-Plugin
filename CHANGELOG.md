@@ -1,9 +1,34 @@
 # 更新日志
 
+## 1.1.3 · 2026-10-11
+
+### 新增
+
+- 互动卡片：全局 `cardTemplateId` 配置后文本 / Markdown 与按钮合并为一张互动卡片投放（万能模板：Markdown 正文 + 最多 5 行按钮组，行结构对齐 Yunzai 按钮段二维数组），卡片外显摘要自动从正文提取
+- 互动卡片按钮回调：`callback` / `input` 按钮点击经 Stream 回调接收，内容模拟为点击者的消息事件触发插件指令处理，回复返回原会话；群 / 单聊场域按发送时记录的映射判断，不依赖群列表时序
+- 全局 Markdown 开关：`markdown: true`（默认）开启后普通文本也按 Markdown 消息发送，关闭发纯文本；显式携带 `segment.markdown` 段时始终按 Markdown 发送，支持热重载
+- ActionCard 按钮增强：按数量自动匹配 `sampleActionCard` ~ `sampleActionCard5`（字段名严格对应官方要求），支持链接与 `callback` / `input` 按钮混合，超过 5 个截取前 5 个并警告
+- 语音转码链路：原生 amr 直接发送；silk 经 silk-wasm 解码后转 amr；其他格式经 ffmpeg 转 amr；转码失败统一降级为文件附件
+- 音乐分享：`segment.music` 段以 `sampleLink` 链接消息发送（标题 / 简介 / 封面 / 跳转地址）
+- 视频参数补全：ffprobe 自动探测时长（秒）/ 宽 / 高，无封面源时 ffmpeg 抽取首帧作为封面；媒体发送前统一获取真实文件 Buffer，规避 `http: true` 返回 URL 字符串导致探测失败
+- 锅巴配置：新增 `markdown` / `cardTemplateId` 字段，保存时正确回显避免空值覆盖
+
+### 修复
+
+- 卡片回调事件预置 `isGroup` / `isPrivate`，避免 loader 冷却检查将事件误判为群消息静默拦截
+- 回调触发的模拟消息无 `sessionWebhook` 时：卡片走卡片接口、正文走机器人消息接口，不再报「消息缺少 sessionWebhook」
+
+### 优化
+
+- 图片 URL 统一接入 ImageBed-Plugin 的 `Bot.imageToUrl`（图床优先，失败回退 `Bot.fileToUrl`）
+- 卡片回调日志降为 debug 级别
+- README 增补互动卡片配置说明、卡片平台地址与权限要求
+
 ## 1.1.1 · 2026-10-10
 
 ### 新增
 
+- 混合消息分段发送：图文混排等混合消息按段顺序拆组，连续媒体段走接口方式发原生媒体，其余段合并走 Webhook，按原顺序依次发送（携带 markdown 段时保持整条一条，图片内嵌公网 URL）
 - 按钮消息：`segment.button` 段提取链接按钮转 ActionCard 发送（`btns` 数组格式，最多 5 个竖排按钮），兼容任意嵌套深度与被反引号包裹的 URL
 - 引用回复：`segment.reply` 段以纯文本「回复：原内容」前缀展示，被引用内容取自消息缓存（上限 200 条）
 - 语音 / 视频接收：单聊事件 `audio` / `video` 类型经 `messageFiles/download` 换取 CDN 地址，映射为 `audio` / `video` 段
