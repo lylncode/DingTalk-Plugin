@@ -1,5 +1,31 @@
 # 更新日志
 
+## 1.1.5 · 2026-10-11
+
+### 新增
+
+- Bot API 补齐： `getFriendArray` / `getFriendList` / `getGroupArray` / `getGroupList` / `getGroupMemberMap` / `getGroupMemberArray` / `getGroupMemberList` / `getSystemMsg` / `getCookies` / `getCsrfToken` / `uploadImage` / `uploadVideo` / `uploadFile` 与好友 / 成员 / 群对象上的 `name` / `is_friend` / `is_owner` / `is_admin` / `card` / `getAvatarUrl` / `getMemberMap` 等字段方法；不支持的能力不再暴露（移除占位方法，避免返回 reject 导致第三方插件等待挂起）
+- 用户与群信息查询：`bot.getUserInfo(userIds)` 批量查询通讯录用户详情、`bot.getChatInfo(groupId)` 查询自建群群名 / 群主 / 成员列表；`pickFriend.getInfo()` 真查详情补全昵称头像，`pickGroup.getInfo()` 自建群拉取真实信息并填充成员缓存
+- 消息撤回：`recallMsg` 真实实现——接口方式发送的普通消息记录 `processQueryKey` 并与真实 `message_id` 绑定（24h），撤回走群聊 `groupMessages/recall` / 单聊 `otoMessages/batchRecall` 官方接口；发送链路各分支返回真实 message_id（多条媒体返回数组）
+- 纯文本卡片化开关 `cardText`：默认关闭时纯文本 / Markdown 走普通消息接口（可撤回），开启时也合并为互动卡片投放（钉钉互动卡片不支持撤回）
+- 语音音质提升：非 ogg / amr 语音经 ffmpeg 转码为 ogg / opus（32kbps 全频带），替代原 8kHz amr 窄带转码，音质明显提升；原生 ogg / amr 直接发送，转码失败仍降级为文件附件
+- 全局 Markdown 下音乐等媒体段独立走接口发送：`music` / `audio` / `record` / `video` / `file` 段从 Markdown 渲染中摘出，按原本接口方式发送，剩余文本 + 图片继续 Markdown 渲染
+- 机器人资料完善：机器人头像 / 昵称支持——群聊事件回填真实资料，带签名的临时头像链接自动转存为稳定地址（启动与群聊事件时），bot 复用时同步配置昵称 / 头像
+- 消息发送完全移除 Webhook 依赖：文本 / Markdown / 媒体 / 按钮 / 卡片全部走机器人消息接口（群聊 `groupMessages/send`，单聊 `oToMessages/batchSend`），移除设置命令 Webhook 参数、锅巴 Webhook 配置项
+
+### 修复
+
+- 卡片回调群 / 单聊判定加强：场域映射改双 key（outTrackId + spaceId）并延长 TTL 至 7 天，回调时优先查映射，未命中按钉钉场域特征兜底（openConversationId 固定 `cid` 前缀），不再因缓存过期误判私聊
+- 撤回未命中记录时不再抛错：`recallMsg` 对互动卡片 / 非接口消息静默返回 `false` + debug 日志，避免插件定时调用产生 unhandled rejection
+- 语音播放卡顿 / 无法播放：全局 Markdown 模式下音乐等媒体段被吞的问题
+- `#椰奶状态pro` 卡住：bot `avatar` 空串时状态插件对空 URL 发请求挂起，默认改为 `"default"` 占位；补 `status` 与 `sent_msg_cnt` / `recv_msg_cnt` 统计，对齐 Yunzai 标准 bot 字段
+- oicq `segment.button` 二维数组多包一层导致按钮解析为 0 行的问题
+
+### 优化
+
+- 空正文按钮消息不再发送（避免 `+1` 等插件附加按钮产生的空白卡片）
+- 按钮点击恢复原会话：修复 rollpig 等插件点击回调因缓存过期误发私聊
+
 ## 1.1.4 · 2026-10-11
 
 ### 新增

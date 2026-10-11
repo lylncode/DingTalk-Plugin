@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="logo.ico" width="96" alt="DingTalk Logo" />
+
 # TRSS-Yunzai DingTalk Plugin
 
 TRSS-Yunzai 钉钉适配器插件
@@ -39,7 +41,7 @@ git clone --depth=1 https://github.com/lylncode/DingTalk-Plugin.git ./plugins/Di
 ## 使用教程
 
 - `#DingTalk账号` 查看已连接账号
-- `#DingTalk设置ClientId:ClientSecret[:默认Webhook]` 添加或更新账号
+- `#DingTalk设置ClientId:ClientSecret` 添加或更新账号
 
 配置文件 `config/DingTalk.yaml` 也可直接编辑，支持锅巴配置
 
@@ -51,7 +53,7 @@ git clone --depth=1 https://github.com/lylncode/DingTalk-Plugin.git ./plugins/Di
 
 ## 互动卡片
 
-配置全局 `cardTemplateId` 后，正文与按钮合并为一张互动卡片投放（正文 Markdown + 任意行按钮）：
+配置全局 `cardTemplateId` 后，**带按钮的消息**（以及开启 `cardText` 后的纯文本）合并为一张互动卡片投放（正文 Markdown + 任意行按钮）：
 
 1. 在 [钉钉卡片平台](https://open-dev.dingtalk.com/fe/card) 导入插件附带的 [万能模板.json](万能模板.json) 并发布
 2. 将发布后的模板 ID（`xxxx.schema`）填入 `config/DingTalk.yaml` 的 `cardTemplateId`，支持锅巴配置、热重载
@@ -60,6 +62,7 @@ git clone --depth=1 https://github.com/lylncode/DingTalk-Plugin.git ./plugins/Di
    - `callback` / `input` 按钮：点击后内容作为消息触发插件指令处理，回复返回原会话
 4. 按钮最多 5 行；按钮颜色按 `style` 自动映射：`0` 黑灰、`1` 蓝色线框、`2` 金色、`3` 红灰、`4` 实底蓝色，缺省蓝色线框
 5. 卡片点击回调经 Stream 通道接收，无需配置回调地址
+6. 纯文本消息默认仍走普通消息接口（**可撤回**）；开启 `cardText` 后纯文本也走卡片，但钉钉**互动卡片不支持撤回**（仅普通消息可撤回）
 
 ## 图片与图床
 
@@ -78,10 +81,10 @@ git clone --depth=1 https://github.com/lylncode/DingTalk-Plugin.git ./plugins/Di
 
 - `permission`：管理指令权限，默认 `master`
 - `markdown`：全局 Markdown 开关，默认开启，开启后普通文本也按 Markdown 消息发送
-- `cardTemplateId`：互动卡片模板 ID，配置后文本 / Markdown + 按钮消息走互动卡片投放，详见「互动卡片」
+- `cardTemplateId`：互动卡片模板 ID，配置后带按钮的消息走互动卡片投放，详见「互动卡片」
+- `cardText`：纯文本是否也走互动卡片，默认关闭（纯文本走普通消息可撤回）
 - `dingdingAccounts`：账号列表，`#DingTalk设置` 命令或锅巴添加，每账号支持：
   - `clientId` / `clientSecret`：应用凭证（必填）
-  - `webhook`：默认 Webhook，主动发送（无 sessionWebhook）时的回退地址
   - `botName` / `botAvatar`：状态页展示的机器人名称 / 头像（群聊事件会自动回填真实资料）
   - `userInfo`：设为 `false` 关闭通讯录用户详情查询
   - `autoReconnect`：断线自动重连，默认开启
@@ -105,7 +108,7 @@ git clone --depth=1 https://github.com/lylncode/DingTalk-Plugin.git ./plugins/Di
 - 平台 ID：钉钉回调的 `chatbotUserId` 为真实 Bot ID，适配器收到首条消息后自动学习保存，`self_id` 为 `dd_` 前缀 URL 编码形式；主人配置需使用该 ID
 - 机器人名称 / 头像：群聊事件自动查询群机器人列表回填真实资料；私聊场景使用账号配置的 `botName` / `botAvatar`
 - 用户昵称 / 头像：优先事件自带 `senderNick`，头像通过通讯录用户详情接口补全（需成员信息读权限，未开通不影响消息处理）
-- 默认 Webhook：回复消息优先使用事件自带 `sessionWebhook`，主动发送（无 sessionWebhook）时回退账号配置的默认 Webhook
+- 消息发送：全部走机器人消息接口方式，不依赖 Webhook 地址
 
 ## 相关链接
 

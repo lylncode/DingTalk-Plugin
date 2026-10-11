@@ -21,8 +21,11 @@ const { config, configSave, configFile } = await makeConfig(
     permission: "master",
     // 全局 Markdown 开关：开启后普通文本消息也按 Markdown 消息发送，关闭则发纯文本（Markdown 段始终按 Markdown 发送）
     markdown: true,
-    // 互动卡片模板 ID：配置后文本/Markdown 消息走互动卡片投放（万能模板：md 正文 + 任意数量按钮 + Stream 回调）
+    // 互动卡片模板 ID：配置后带按钮的消息走互动卡片投放（万能模板：md 正文 + 任意数量按钮 + Stream 回调）
     cardTemplateId: "",
+    // 纯文本也走互动卡片：默认关闭（纯文本/Markdown 走普通消息接口，可正常撤回）；
+    // 开启后所有文本消息也合并为互动卡片投放，但钉钉卡片不支持撤回
+    cardText: false,
     // 媒体上传策略（保留字段，图片经图床/本地转 URL 发送）
     uploadStrategy: "public-url",
     dingdingAccounts: [],
@@ -54,6 +57,8 @@ const adapter = new (class DingTalkAdapter {
     this.messageCache = new Map()
     // 互动卡片场域映射（outTrackId -> { group_id, user_id }）：卡片回调据此刻别群/单聊，避免依赖 gl 时序
     this.cardSpaces = new Map()
+    // 接口方式发送的消息记录（message_id -> { group_id, robotCode, processQueryKey }，24h，供撤回）
+    this.msgKeys = new Map()
   }
 
   // bot self_id：钉钉 platformId（chatbotUserId）学习后写回配置，未学习前用账号标识
@@ -177,6 +182,18 @@ const adapter = new (class DingTalkAdapter {
     return data.result || {}
   }
 
+  // 批量查询用户详情：钉钉无批量接口，逐个查询（命中缓存加速）后汇总为 Map<userId, 详情>
+  async getUserInfos(account, userIds) {
+    const list = Array.isArray(userIds) ? userIds : [userIds]
+    const map = new Map()
+    for (const id of list) {
+      if (!id) continue
+      const info = await this.getUserInfo(account, String(id)).catch(() => ({}))
+      if (info && Object.keys(info).length) map.set(String(id), info)
+    }
+    return map
+  }
+
   // 群机器人列表（用于回填机器人真实名称/头像），按 账号:群id 缓存一天
   async getGroupRobots(account, groupId) {
     if (!groupId) return []
@@ -194,6 +211,17 @@ const adapter = new (class DingTalkAdapter {
     const value = Array.isArray(data.chatbotInstanceVOList) ? data.chatbotInstanceVOList : []
     this.setCache(this.groupRobotCache, key, value)
     return value
+  }
+
+  // 群信息（自建群）：GET /chat/get，返回群名、群主、成员 userId 列表；非自建群无 chatid 时返回 null
+  async getChatInfo(account, groupId) {
+    const chatid = account.chatIds?.[String(groupId)]
+    if (!chatid) return null
+    const response = await fetch(`https://oapi.dingtalk.com/chat/get?access_token=${account.accessToken}&chatid=${encodeURIComponent(chatid)}`)
+    const data = await response.json().catch(() => ({}))
+    if (!response.ok || (data.errcode && Number(data.errcode) !== 0))
+      throw new Error(`获取 DingTalk 群信息失败: ${Bot.String(data)}`)
+    return data.chat_info || null
   }
 
   // bot 所属账号配置（群管理接口需要 accessToken，不在 bot 上暴露完整配置）
@@ -276,10 +304,15 @@ const adapter = new (class DingTalkAdapter {
       entry.bot.nickname = String(profile.name)
       changed = true
     }
-    if (profile.downloadIconURL && (!entry.config.botAvatar || entry.config.botAvatar === entry.bot.avatar)) {
-      entry.config.botAvatar = String(profile.downloadIconURL)
-      entry.bot.avatar = String(profile.downloadIconURL)
-      changed = true
+    // 头像：未配置或当前为带签名的临时链接（会过期）时，用群内机器人真实头像并转存为稳定地址
+    const tempAvatar = !entry.config.botAvatar || /(x-oss-signature|ossaccesskeyid|expires=|signature=)/i.test(entry.config.botAvatar)
+    if (profile.downloadIconURL && tempAvatar) {
+      const avatar = await this.makeBotAvatar(String(profile.downloadIconURL))
+      if (avatar && avatar !== entry.config.botAvatar) {
+        entry.config.botAvatar = avatar
+        entry.bot.avatar = avatar
+        changed = true
+      }
     }
     if (changed) configSave()
   }
@@ -302,6 +335,15 @@ const adapter = new (class DingTalkAdapter {
     }
     const entry = { config: account, bot, socket }
     this.managedAccounts.set(accountId, entry)
+    // 配置中的机器人头像是带签名的临时链接时，启动即转存为稳定地址（避免过期失效）
+    if (account.botAvatar && /(x-oss-signature|ossaccesskeyid|expires=|signature=)/i.test(account.botAvatar))
+      this.makeBotAvatar(account.botAvatar).then(url => {
+        if (url && url !== account.botAvatar) {
+          account.botAvatar = url
+          bot.avatar = url
+          configSave()
+        }
+      }).catch(() => {})
     if (account.lastConversationId)
       this.updateBotProfile(entry, {
         conversationType: "2",
@@ -348,17 +390,24 @@ const adapter = new (class DingTalkAdapter {
     this.managedAccounts.set(accountId, { ...old, config: account, timer })
   }
 
-  // 创建/复用 bot 实例：同适配器同 id 直接复用
+  // 创建/复用 bot 实例：同适配器同 id 复用，并同步配置里的昵称/头像（配置更新后重连即生效）
   makeBot(self_id, account) {
     const old = Bot[self_id] || Bot.bots[self_id]
-    if (old?.adapter === this) return old
+    if (old?.adapter === this) {
+      if (account.botName) old.nickname = account.botName
+      if (account.botAvatar) old.avatar = account.botAvatar
+      return old
+    }
     const bot = {
       adapter: this,
       self_id,
       uin: self_id,
       dingtalk_id: account.platformId,
       nickname: account.botName || `DingTalkBot (${account.accountId})`,
-      avatar: account.botAvatar || "",
+      // 头像默认 "default"（yenai 等状态插件识别为占位并走本地默认图，避免空串对空 URL 发请求卡死）
+      avatar: account.botAvatar || "default",
+      // 在线状态（1 在线；状态插件读取，未设置时按离线处理）
+      status: 1,
       // 账号配置摘要（updateBotProfile 会动态补充 robotCode 等字段）
       info: {
         id: self_id,
@@ -368,7 +417,7 @@ const adapter = new (class DingTalkAdapter {
         robotCode: account.robotCode,
       },
       version: { id: self_id, name: this.name, version: this.version },
-      stat: { start_time: Date.now() / 1000 },
+      stat: { start_time: Date.now() / 1000, sent_msg_cnt: 0, recv_msg_cnt: 0 },
       fl: new Map(),
       gl: new Map(),
       gml: new Map(),
@@ -377,16 +426,43 @@ const adapter = new (class DingTalkAdapter {
       login: () => this.startAccount(account),
       logout: () => this.stopAccount(account.accountId || account.clientId),
       getFriendMap: () => bot.fl,
+      getFriendArray: () => [...bot.fl.values()],
+      getFriendList: () => [...bot.fl.keys()],
       getGroupMap: () => bot.gl,
+      getGroupArray: () => [...bot.gl.values()],
+      getGroupList: () => [...bot.gl.keys()],
       getMemberMap: group_id => bot.gml.get(String(group_id)),
+      getGroupMemberMap: group_id => bot.gml.get(String(group_id)),
+      getGroupMemberArray: group_id => [...(bot.gml.get(String(group_id))?.values() || [])],
+      getGroupMemberList: group_id => [...(bot.gml.get(String(group_id))?.keys() || [])],
       pickFriend: user_id => this.pickFriend(bot, user_id),
       get pickUser() {
         return this.pickFriend
       },
       pickGroup: group_id => this.pickGroup(bot, group_id),
       pickMember: (group_id, user_id) => this.pickMember(bot, group_id, user_id),
+      // 好友/入群申请：钉钉无好友体系与入群申请接口，返回空列表
+      request_list: [],
+      getSystemMsg: () => [],
+      // 登录凭证：钉钉使用 accessToken，无 cookie/csrf 概念
+      getCookies: () => "",
+      getCsrfToken: () => "",
       // 创建内部群，返回 group_id（openConversationId）：{ name, owner, members } 均为 userId
       createGroup: options => this.createGroup(account, options),
+      uploadImage: async input => this.uploadMedia(account, "image", await Bot.fileType({ file: String(input) }, { http: true })),
+      uploadVideo: async input => this.uploadMedia(account, "video", await Bot.fileType({ file: String(input) }, { http: true })),
+      uploadFile: async (input, name) => {
+        const file = await Bot.fileType({ file: String(input) }, { http: true })
+        if (name) file.name = name
+        return this.uploadMedia(account, "file", file)
+      },
+      // 用户详情（单个或数组）：钉钉通讯录查询，返回 Map<userId, 详情>
+      getUserInfo: userIds => this.getUserInfos(account, userIds),
+      // 群信息（自建群）：返回群名、群主、成员 userId 列表
+      getChatInfo: groupId => this.getChatInfo(account, groupId),
+      // 撤回消息：接口方式发送且 24h 内可撤回
+      recallMsg: message_id => this.recallMsg(account, message_id),
+      replys: {},
       // 互动卡片 API：完全走开放接口操作卡片实例
       createCard: body => this.createCard(account, body),
       createAndDeliverCard: body => this.createAndDeliverCard(account, body),
@@ -446,17 +522,63 @@ const adapter = new (class DingTalkAdapter {
     const info = { ...(bot.fl.get(user_id) || {}), user_id, self_id: bot.self_id, ...context }
     return {
       ...info,
+      get name() {
+        return this.nickname
+      },
       sendMsg: message => this.sendMessage(bot, info, message),
       sendFile: (file, name) => this.sendMessage(bot, info, [{ type: "file", file, name }]),
-      getInfo: async () => info,
+      // 撤回消息：接口方式发送且 24h 内可撤回（走 sendRobotMessage 记录的真实 message_id）
+      recallMsg: message_id => this.recallMsg(this.configFor(bot), message_id),
+      getAvatarUrl: async () => {
+        if (info.avatar) return info.avatar
+        // 无缓存头像时查通讯录用户详情补全（需成员信息读权限，查不到返回空串）
+        const config = this.configFor(bot)
+        if (!config?.accessToken) return ""
+        const data = await this.getUserInfo(config, user_id).catch(() => ({}))
+        if (data.avatar && !info.avatar) {
+          info.avatar = data.avatar
+          bot.fl.set(user_id, { ...bot.fl.get(user_id), user_id, avatar: data.avatar })
+        }
+        return data.avatar || info.avatar || ""
+      },
+      getInfo: async () => {
+        // 查询通讯录用户详情补全昵称/头像（需成员信息读权限，未开通时返回缓存信息）
+        const config = this.configFor(bot)
+        if (config?.accessToken) {
+          const detail = await this.getUserInfo(config, user_id).catch(() => null)
+          if (detail) {
+            info.nickname = detail.nickname || info.nickname
+            info.avatar = detail.avatar || info.avatar
+            bot.fl.set(user_id, { ...bot.fl.get(user_id), user_id, nickname: info.nickname, avatar: info.avatar })
+          }
+        }
+        return info
+      },
     }
   }
 
   pickMember(bot, group_id, user_id) {
+    group_id = String(group_id)
+    user_id = String(user_id)
+    const friend = this.pickFriend(bot, user_id)
     return {
-      ...this.pickFriend(bot, user_id),
-      group_id: String(group_id),
-      user_id: String(user_id),
+      ...friend,
+      group_id,
+      user_id,
+      get card() {
+        return this.nickname
+      },
+      get is_friend() {
+        return bot.fl.has(user_id)
+      },
+      // 钉钉成员角色仅群主/成员，未查询到角色信息时按普通成员处理
+      get is_owner() {
+        return false
+      },
+      get is_admin() {
+        return this.is_owner
+      },
+      getInfo: async () => ({ ...(await friend.getInfo()), group_id, user_id }),
     }
   }
 
@@ -465,14 +587,63 @@ const adapter = new (class DingTalkAdapter {
     const info = { ...(bot.gl.get(group_id) || {}), group_id, self_id: bot.self_id, ...context }
     return {
       ...info,
+      get name() {
+        return this.group_name || this.group_id
+      },
+      get is_owner() {
+        return false
+      },
       sendMsg: message => this.sendMessage(bot, info, message),
       sendFile: (file, name) => this.sendMessage(bot, info, [{ type: "file", file, name }]),
+      // 撤回消息：接口方式发送且 24h 内可撤回（走 sendRobotMessage 记录的真实 message_id）
+      recallMsg: message_id => this.recallMsg(this.configFor(bot), message_id),
       pickMember: user_id => this.pickMember(bot, group_id, user_id),
-      getInfo: async () => info,
+      getMemberMap() {
+        return bot.gml.get(group_id)
+      },
+      getMemberList() {
+        return [...(bot.gml.get(group_id)?.keys() || [])]
+      },
+      getMemberArray() {
+        return [...(bot.gml.get(group_id)?.values() || [])]
+      },
+      getAvatarUrl: () => info.avatar || "",
+      getInfo: async () => {
+        // 自建群可通过 chat/get 拉取真实群名/群主/成员列表（非自建群无 chatid，返回缓存信息）
+        const chat = await this.getChatInfo(this.configFor(bot), group_id).catch(() => null)
+        if (chat) {
+          info.group_name = chat.name || info.group_name
+          info.owner = chat.owner
+          info.member_count = Array.isArray(chat.useridlist) ? chat.useridlist.length : info.member_count
+          const memberMap = bot.gml.get(group_id) || new Map()
+          for (const uid of chat.useridlist || [])
+            memberMap.set(String(uid), { ...(memberMap.get(String(uid)) || {}), user_id: String(uid), group_id })
+          bot.gml.set(group_id, memberMap)
+          bot.gl.set(group_id, { ...bot.gl.get(group_id), group_id, group_name: info.group_name })
+        }
+        return info
+      },
       // 修改群名（仅支持本插件创建的群，钉钉限制：chatid 只有创建群接口会返回）
       setGroupName: name => this.setGroupName(this.configFor(bot), group_id, name),
+      setName: name => this.setGroupName(this.configFor(bot), group_id, name),
       // 拉人进群，可传单个 userId 或数组
       addMember: user_id => this.addGroupMember(this.configFor(bot), group_id, user_id),
+    }
+  }
+
+  // 机器人头像转稳定地址：downloadIconURL / botAvatar 多为带签名的临时链接（含过期参数），
+  // 下载后经图床（Bot.imageToUrl）或文件服务（Bot.fileToUrl）转存，失败回退原链接
+  async makeBotAvatar(url) {
+    if (!url || url === "default") return url
+    try {
+      const file = await Bot.fileType({ file: String(url) }, { http: true })
+      if (typeof Bot.imageToUrl === "function") {
+        const out = await Bot.imageToUrl(file, { name: "robot-avatar.jpg" })
+        if (out) return out
+      }
+      return await Bot.fileToUrl(file) || String(url)
+    } catch {
+      return String(url)
     }
   }
 
@@ -532,27 +703,28 @@ const adapter = new (class DingTalkAdapter {
     })
   }
 
-  // 转码为 amr（钉钉 voice 上传仅接受 amr），返回 { name, buffer, duration(秒) }
+  // 转码为 ogg/opus（钉钉 voice 上传支持 ogg、amr，ogg 为 opus 全频带音质远好于 8kHz 的 amr），
+  // 返回 { name, buffer, duration(秒) }
   // silk 语音（shareMusic 等插件产出）ffmpeg 无法解码，先经 silk-wasm 解码为 pcm 再转
-  async convertAmr(file) {
+  async convertVoice(file) {
     const input = path.join(tmpdir(), `dingtalk-${Date.now()}`)
-    const output = `${input}.amr`
+    const output = `${input}.ogg`
     let buffer = file.buffer
     // silk 数据头部自带 0x02 前缀（silk-wasm 编码/QQ 语音均如此），decode 需保留原样传入
     if (buffer.subarray(0, 10).toString().includes("#!SILK")) {
       const { decode } = await import("silk-wasm")
       buffer = (await decode(buffer, 24000)).data
       await writeFile(input, buffer)
-      await this.runCmd("ffmpeg", ["-y", "-f", "s16le", "-ar", "24000", "-ac", "1", "-i", input, "-ar", "8000", "-ac", "1", "-ab", "12.2k", output])
+      await this.runCmd("ffmpeg", ["-y", "-f", "s16le", "-ar", "24000", "-ac", "1", "-i", input, "-c:a", "libopus", "-b:a", "32k", output])
     } else {
       await writeFile(input, buffer)
-      await this.runCmd("ffmpeg", ["-y", "-i", input, "-ar", "8000", "-ac", "1", "-ab", "12.2k", output])
+      await this.runCmd("ffmpeg", ["-y", "-i", input, "-c:a", "libopus", "-b:a", "32k", output])
     }
     try {
       const duration = Number(await this.runCmd("ffprobe", ["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", output])) || 0
       return {
-        name: `${String(file.name || "audio").replace(/\.\w+$/, "")}.amr`,
-        type: { ext: "amr" },
+        name: `${String(file.name || "audio").replace(/\.\w+$/, "")}.ogg`,
+        type: { ext: "ogg" },
         buffer: await readFile(output),
         duration,
       }
@@ -595,14 +767,17 @@ const adapter = new (class DingTalkAdapter {
       }
       case "audio":
       case "record": {
-        // 钉钉 voice 上传仅接受 amr：有 ffmpeg 时转码为 amr 走语音气泡，失败降级为文件附件发送
+        // 钉钉 voice 上传接受 ogg / amr：原生 ogg/amr 直接发送，其余格式经 ffmpeg 转码 ogg/opus 提升音质，
+        // 转码失败降级为文件附件发送
         // http:true 时 Bot.fileType 的 buffer 可能是 URL 字符串，转码前统一取真实 Buffer
         const file = await Bot.fileType(data, { http: true })
         if (!Buffer.isBuffer(file.buffer)) file.buffer = Buffer.from(await (await fetch(file.url)).arrayBuffer())
         try {
-          const amr = file.type?.ext === "amr" ? file : await this.convertAmr(file)
-          const duration = Number(data.duration || amr.duration || 0)
-          return { mediaId: await this.uploadMedia(account, "voice", amr), duration: String(Math.round(duration * 1000)) }
+          const voice = ["ogg", "amr"].includes(file.type?.ext)
+            ? file
+            : await this.convertVoice(file)
+          const duration = Number(data.duration || voice.duration || 0)
+          return { mediaId: await this.uploadMedia(account, "voice", voice), duration: String(Math.round(duration * 1000)) }
         } catch (error) {
           this.log("debug", account.accountId, "语音转码失败，降级为文件附件发送", error)
           const name = data.name || file.name || "audio.mp3"
@@ -674,6 +849,8 @@ const adapter = new (class DingTalkAdapter {
   }
 
   // 接口方式发送机器人消息：群聊 groupMessages/send，单聊 oToMessages/batchSend
+  // 成功后返回 { ...result, message_id }：message_id 与接口返回的 processQueryKey 绑定，
+  // 供 recallMsg 在 24 小时内撤回（官方仅支持撤回当天消息）
   async sendRobotMessage(account, data, msgKey, msgParam) {
     const isGroup = data.group_id
     const url = isGroup
@@ -695,6 +872,40 @@ const adapter = new (class DingTalkAdapter {
     const result = await response.json().catch(() => ({}))
     if (!response.ok || result.code)
       throw new Error(`DingTalk 媒体发送失败: ${Bot.String(result)}`)
+    // 消息 id 与 processQueryKey 绑定缓存（24h），撤回接口按此 key 定位消息
+    const message_id = `${isGroup ? "g" : "p"}${isGroup ? data.group_id : (data.dingtalk_event?.senderStaffId || data.user_id)}_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`
+    if (result.processQueryKey)
+      this.setCache(this.msgKeys, message_id, {
+        group_id: data.group_id || "",
+        robotCode: account.robotCode || account.clientId,
+        processQueryKey: String(result.processQueryKey),
+      })
+    return { ...result, message_id }
+  }
+
+  // 撤回机器人发送的消息（官方限制：仅可撤回 24 小时内的普通消息）：
+  // 群聊 groupMessages/recall，单聊 otoMessages/batchRecall
+  // 互动卡片消息钉钉无撤回接口（卡片仅支持更新 / 关闭吊顶），未记录 processQueryKey 时静默返回 false
+  async recallMsg(account, message_id) {
+    const record = this.getCache(this.msgKeys, String(message_id || ""))
+    if (!record?.processQueryKey) {
+      this.log("debug", account.accountId, "撤回跳过：非接口消息或互动卡片（钉钉不支持撤回卡片消息）", String(message_id))
+      return false
+    }
+    const url = record.group_id
+      ? "https://api.dingtalk.com/v1.0/robot/groupMessages/recall"
+      : "https://api.dingtalk.com/v1.0/robot/otoMessages/batchRecall"
+    const body = record.group_id
+      ? { openConversationId: record.group_id, robotCode: record.robotCode, processQueryKeys: [record.processQueryKey] }
+      : { robotCode: record.robotCode, processQueryKeys: [record.processQueryKey] }
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-acs-dingtalk-access-token": account.accessToken },
+      body: JSON.stringify(body),
+    })
+    const result = await response.json().catch(() => ({}))
+    if (!response.ok || result.code)
+      throw new Error(`DingTalk 消息撤回失败: ${Bot.String(result)}`)
     return result
   }
 
@@ -903,17 +1114,18 @@ const adapter = new (class DingTalkAdapter {
   }
 
   // 发送媒体段：转换接口参数后按类型映射 msgKey，语音转码成功（无 fileName）走语音气泡 sampleAudio
+  // 返回接口发送结果（含与 processQueryKey 绑定的 message_id，供撤回）
   async sendMedia(config, data, segment) {
     const msgParam = await this.makeMediaParam(config, segment)
     const msgKey =
       (segment.type === "audio" || segment.type === "record") && !msgParam.fileName
         ? "sampleAudio"
         : { image: "sampleImageMsg", audio: "sampleFile", record: "sampleFile", music: "sampleLink", video: "sampleVideo", file: "sampleFile" }[segment.type]
-    await this.sendRobotMessage(config, data, msgKey, JSON.stringify(msgParam))
+    return this.sendRobotMessage(config, data, msgKey, JSON.stringify(msgParam))
   }
 
   // 发送消息：默认纯文本，携带 markdown 段时整条按 Markdown 发送；提取到按钮时改发 ActionCard（最多 5 个）
-  // 回复事件携带 sessionWebhook 优先使用，否则回退账号配置的默认 webhook
+  // 全部消息走机器人消息接口方式（无需 sessionWebhook）：群聊 groupMessages/send，单聊 oToMessages/batchSend
   async sendMessage(bot, data, message) {
     const entry = [...this.managedAccounts.values()].find(item => item.bot === bot)
     if (!entry?.config) {
@@ -925,7 +1137,7 @@ const adapter = new (class DingTalkAdapter {
     const segments = Array.isArray(message) ? [...message] : [message]
     const markdown = config.markdown || this.hasMarkdown(segments)
     // 消息分段发送：钉钉单条消息无法图文混排原生图片，按段顺序拆组——
-    // 连续媒体段（image/audio/video/file）一组走接口方式，其余段合并一组走 Webhook；
+    // 连续媒体段（image/audio/video/file）一组走接口方式，其余文本段合并一组走消息接口；
     // Markdown 模式时不分段
     if (!markdown) {
       const MEDIA = ["image", "audio", "record", "music", "video", "file"]
@@ -943,35 +1155,75 @@ const adapter = new (class DingTalkAdapter {
         }
       }
       if (groups.length > 1 || (groups.length === 1 && groups[0].media)) {
+        const ids = []
         for (const group of groups) {
-          if (group.rest)
-            await this.sendMessage(bot, data, group.rest)
-          for (const seg of group.media || []) await this.sendMedia(entry.config, data, seg)
+          if (group.rest) {
+            const ret = await this.sendMessage(bot, data, group.rest)
+            if (ret?.message_id) ids.push(...(Array.isArray(ret.message_id) ? ret.message_id : [ret.message_id]))
+          }
+          for (const seg of group.media || []) {
+            const ret = await this.sendMedia(entry.config, data, seg)
+            if (ret?.message_id) ids.push(ret.message_id)
+          }
         }
         const target = data.group_id ? `群消息：[${data.group_id}]` : `好友消息：[${data.user_id || "unknown"}]`
         Bot.makeLog("info", [target, `[分段:${groups.length}组]`], this.logId(bot.self_id))
         bot.stat.message_sent = (bot.stat.message_sent || 0) + 1
-        return { message_id: `${bot.self_id}_${Date.now().toString(36)}` }
+        bot.stat.sent_msg_cnt = (bot.stat.sent_msg_cnt || 0) + 1
+        return { message_id: ids.length === 1 ? ids[0] : ids }
+      }
+    }
+    // 全局 Markdown 开启时：图片内嵌正文渲染，但音乐等其余媒体段仍按原本接口方式独立发送，
+    // 避免与文本混合时被 Markdown 渲染吞掉（renderMessage 对 music 不输出正文，卡会消失）
+    if (markdown) {
+      const MEDIA_ONLY = ["audio", "record", "music", "video", "file"]
+      const mediaOut = []
+      const rest = []
+      for (const seg of segments) {
+        if (MEDIA_ONLY.includes(seg?.type)) mediaOut.push(seg)
+        else rest.push(seg)
+      }
+      if (mediaOut.length) {
+        const ids = []
+        for (const seg of mediaOut) {
+          const ret = await this.sendMedia(entry.config, data, seg)
+          if (ret?.message_id) ids.push(ret.message_id)
+        }
+        if (!rest.length) {
+          const target = data.group_id ? `群消息：[${data.group_id}]` : `好友消息：[${data.user_id || "unknown"}]`
+          Bot.makeLog("info", [target, `[媒体:${mediaOut.length}条]`], this.logId(bot.self_id))
+          bot.stat.message_sent = (bot.stat.message_sent || 0) + 1
+        bot.stat.sent_msg_cnt = (bot.stat.sent_msg_cnt || 0) + 1
+          return { message_id: ids.length === 1 ? ids[0] : ids }
+        }
+        // 剩余文本 + 图片递归走 Markdown 渲染（此时已无媒体段，不会再进入本分支）
+        return this.sendMessage(bot, data, rest)
       }
     }
     // 仅媒体段：走接口方式发送；Markdown 模式下图片由正文内嵌渲染（imageToUrl 图床直链），仅其余媒体走接口
     const media = this.pickMedia(markdown ? segments.filter(segment => segment?.type !== "image") : message)
     if (media?.length) {
-      for (const segment of media) await this.sendMedia(entry.config, data, segment)
+      const ids = []
+      for (const segment of media) {
+        const ret = await this.sendMedia(entry.config, data, segment)
+        if (ret?.message_id) ids.push(ret.message_id)
+      }
       const target = data.group_id ? `群消息：[${data.group_id}]` : `好友消息：[${data.user_id || "unknown"}]`
       Bot.makeLog("info", [target, `[媒体:${media.length}条]`], this.logId(bot.self_id))
       bot.stat.message_sent = (bot.stat.message_sent || 0) + 1
-      return { message_id: `${bot.self_id}_${Date.now().toString(36)}` }
+        bot.stat.sent_msg_cnt = (bot.stat.sent_msg_cnt || 0) + 1
+      return { message_id: ids.length === 1 ? ids[0] : ids }
     }
-    // 回调触发的模拟消息没有 sessionWebhook：卡片走卡片接口、按钮/正文走机器人消息接口，不在此报错
-    const webhook = data.sessionWebhook || entry?.config?.webhook
+    // 正文/按钮走机器人消息接口（可不依赖 sessionWebhook）
     const text = (await this.renderMessage(message, !markdown)).trim()
     const buttons = this.getActionButtons(message)
     Bot.makeLog("debug", ["markdown 段:", markdown, "按钮:", buttons.length, buttons], this.logId(bot.self_id))
-    if (!text && !buttons.length) return false
-    // 互动卡片模式：配置 cardTemplateId 后正文与按钮合并为一张互动卡片投放，
-    // 按钮数量不限：link → openLink 事件，callback/input → sendCardRequest 回传事件（Stream 回调接收）
-    if (config.cardTemplateId) {
+    // 无正文内容时不发送：+1 等插件会在任意回复上附加按钮，纯按钮空消息在钉钉渲染为空白卡片
+    if (!text) return false
+    // 互动卡片模式：配置 cardTemplateId 且（带按钮 或 开启 cardText）时，正文与按钮合并为一张互动卡片投放，
+    // 按钮数量不限：link → openLink 事件，callback/input → sendCardRequest 回传事件（Stream 回调接收）；
+    // 纯文本（无按钮且 cardText 关闭）走普通消息接口，可正常撤回
+    if (config.cardTemplateId && (buttons.length || config.cardText)) {
       const outTrackId = `yz_${Date.now().toString(36)}_${randomUUID().replace(/-/g, "").slice(0, 12)}`
       const robotCode = entry.config.robotCode || entry.config.clientId
       // 卡片按行渲染按钮：Yunzai 按钮段二维数组每个子数组一行，模板提供 row1~row5 五个按钮组
@@ -1021,15 +1273,23 @@ const adapter = new (class DingTalkAdapter {
             }),
       }
       await this.createAndDeliverCard(entry.config, body)
-      // 记录卡片场域映射，回调点击时据此刻别群/单聊
-      this.setCache(this.cardSpaces, outTrackId, {
+      // 记录卡片场域映射，回调点击时据此刻别群/单聊。
+      // 用 outTrackId 与 spaceId（openSpaceId 的会话标识）双 key 记录，TTL 7 天：
+      // 定时推送 / 跨天点击的卡片 outTrackId 缓存可能已过期，spaceId 键仍可命中
+      const spaceValue = {
         group_id: data.group_id || "",
         user_id: String(body.userId || data.user_id || ""),
-      })
+      }
+      this.setCache(this.cardSpaces, outTrackId, spaceValue, 7 * 86400000)
+      const spaceKey = data.group_id
+        ? String(data.group_id)
+        : String(body.userId || data.user_id || "")
+      if (spaceKey) this.setCache(this.cardSpaces, spaceKey, spaceValue, 7 * 86400000)
       const target = data.group_id ? `群消息：[${data.group_id}]` : `好友消息：[${data.user_id || "unknown"}]`
       const count = cardRows.reduce((sum, row) => sum + row.length, 0)
       Bot.makeLog("info", [target, `[互动卡片:${cardRows.length}行${count}按钮] ${text}`], this.logId(bot.self_id))
       bot.stat.message_sent = (bot.stat.message_sent || 0) + 1
+        bot.stat.sent_msg_cnt = (bot.stat.sent_msg_cnt || 0) + 1
       return { message_id: outTrackId }
     }
     // 按钮：接口方式按数量选 msgKey——1个 sampleActionCard（singleTitle/singleURL），
@@ -1051,40 +1311,27 @@ const adapter = new (class DingTalkAdapter {
           msgParam[`actionURL${index + 1}`] = button.actionURL
         })
       }
-      await this.sendRobotMessage(entry.config, data, msgKey, JSON.stringify(msgParam))
+      const ret = await this.sendRobotMessage(entry.config, data, msgKey, JSON.stringify(msgParam))
       const target = data.group_id ? `群消息：[${data.group_id}]` : `好友消息：[${data.user_id || "unknown"}]`
       Bot.makeLog("info", [target, `[ActionCard:${cardButtons.length}按钮] ${text}`], this.logId(bot.self_id))
       bot.stat.message_sent = (bot.stat.message_sent || 0) + 1
-      return { message_id: `${bot.self_id}_${Date.now().toString(36)}` }
+        bot.stat.sent_msg_cnt = (bot.stat.sent_msg_cnt || 0) + 1
+      return { message_id: ret?.message_id || `${bot.self_id}_${Date.now().toString(36)}` }
     }
-    const payload = markdown
-      ? { msgtype: "markdown", markdown: { title: bot.nickname || "DingTalk", text } }
-      : { msgtype: "text", text: { content: text } }
-    if (webhook) await this.postWebhook(webhook, payload)
-    else
-      // 无 webhook（如卡片回调触发的模拟消息）时回退机器人消息接口
-      await this.sendRobotMessage(
-        entry.config,
-        data,
-        markdown ? "sampleMarkdown" : "sampleText",
-        JSON.stringify(markdown ? { title: bot.nickname || "DingTalk", text } : { content: text }),
-      )
+    let message_id = `${bot.self_id}_${Date.now().toString(36)}`
+    // 文本 / Markdown 一律走机器人消息接口，不依赖 sessionWebhook
+    const ret = await this.sendRobotMessage(
+      entry.config,
+      data,
+      markdown ? "sampleMarkdown" : "sampleText",
+      JSON.stringify(markdown ? { title: bot.nickname || "DingTalk", text } : { content: text }),
+    )
+    if (ret?.message_id) message_id = ret.message_id
     const target = data.group_id ? `群消息：[${data.group_id}]` : `好友消息：[${data.user_id || "unknown"}]`
     Bot.makeLog("info", [target, text], this.logId(bot.self_id))
     bot.stat.message_sent = (bot.stat.message_sent || 0) + 1
-    return { message_id: `${bot.self_id}_${Date.now().toString(36)}` }
-  }
-
-  // POST webhook 消息，errcode 非 0 抛错
-  async postWebhook(webhook, payload) {
-    const response = await fetch(webhook, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(payload),
-    })
-    const result = await response.json().catch(() => ({}))
-    if (!response.ok || result.errcode) throw new Error(`DingTalk 发送失败: ${Bot.String(result)}`)
-    return result
+        bot.stat.sent_msg_cnt = (bot.stat.sent_msg_cnt || 0) + 1
+    return { message_id }
   }
 
   // Stream 消息体 → Yunzai 事件：解析 @ 提及与媒体（downloadCode 换 CDN 地址），补全用户资料
@@ -1219,10 +1466,14 @@ const adapter = new (class DingTalkAdapter {
     const bot = entry.bot
     const user_id = String(body.userId)
     const spaceId = String(body.spaceId || "")
-    // 群/单聊判断优先查发送卡片时记录的场域映射（outTrackId -> { group_id, user_id }），
-    // bot.gl 依赖适配器收到过该群真实消息才填充，不可靠；未命中时才回退 gl 兜底
-    const space = this.getCache(this.cardSpaces, String(body.outTrackId || "")) || {}
-    const groupId = space.group_id || (bot.gl.has(spaceId) ? spaceId : "")
+    // 群/单聊判定：优先查发送卡片时记录的场域映射（outTrackId 或 spaceId 双 key，TTL 7 天）；
+    // 未命中时按钉钉场域特征兜底——群聊 openConversationId 固定以 cid 开头，其余按单聊处理；
+    // bot.gl 依赖适配器收到过该群真实消息才填充，仅作最后兜底
+    const mapped = this.getCache(this.cardSpaces, String(body.outTrackId || ""))
+      || this.getCache(this.cardSpaces, spaceId)
+    const groupId = mapped
+      ? String(mapped.group_id || "")
+      : (spaceId.startsWith("cid") ? spaceId : (bot.gl.has(spaceId) ? spaceId : ""))
     const isGroup = Boolean(groupId)
     const data = {
       bot,
@@ -1235,7 +1486,7 @@ const adapter = new (class DingTalkAdapter {
       isPrivate: !isGroup,
       sub_type: "callback",
       self_id: bot.self_id,
-      user_id: isGroup ? String(space.user_id || user_id) : user_id,
+      user_id: isGroup ? String(mapped?.user_id || user_id) : user_id,
       message_id: `event_${body.outTrackId || Date.now().toString(36)}`,
       raw_message: action,
       message: [{ type: "text", text: action }],
@@ -1257,6 +1508,7 @@ const adapter = new (class DingTalkAdapter {
       Bot.makeLog("info", [`好友按钮点击事件：[${user_id}]`, action], bot.self_id)
     }
     bot.stat.message_received = (bot.stat.message_received || 0) + 1
+    bot.stat.recv_msg_cnt = (bot.stat.recv_msg_cnt || 0) + 1
     this.log(
       "debug",
       bot.self_id,
@@ -1308,6 +1560,7 @@ const adapter = new (class DingTalkAdapter {
         const data = await this.decode(body, entry.bot, entry.config)
         if (data) {
           entry.bot.stat.message_received = (entry.bot.stat.message_received || 0) + 1
+          entry.bot.stat.recv_msg_cnt = (entry.bot.stat.recv_msg_cnt || 0) + 1
           this.log(
             "info",
             entry.bot.self_id,
@@ -1367,12 +1620,11 @@ export class DingTalkPlugin extends plugin {
     return this.reply(`DingTalk 账号：\n${text}`, true)
   }
 
-  // 设置账号：#DingTalk设置AppKey:AppSecret[:默认Webhook]（格式由正则校验，账号标识直接使用 AppKey）
+  // 设置账号：#DingTalk设置ClientId:ClientSecret（格式由正则校验，账号标识直接使用 Client ID）
   async Set() {
     const parts = this.e.msg.replace(/^#[Dd]ing[Tt]alk设置/, "").trim().split(":")
     const clientId = parts.shift()
     const clientSecret = parts.shift()
-    const webhook = parts.join(":")
     const accountId = clientId
     const accounts = Array.isArray(config.dingdingAccounts) ? config.dingdingAccounts : []
     const old = accounts.find(item => item.accountId === accountId)
@@ -1381,7 +1633,6 @@ export class DingTalkPlugin extends plugin {
       accountId,
       clientId,
       clientSecret,
-      webhook,
       autoReconnect: old?.autoReconnect !== false,
     }
     const index = accounts.findIndex(item => item.accountId === accountId)
