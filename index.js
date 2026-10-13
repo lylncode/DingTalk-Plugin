@@ -39,6 +39,15 @@ const { config, configSave, configFile } = await makeConfig(
   { watch: true },
 )
 
+// 最大自动重连次数：断开即尝试重连，累计到 100 次仍失败才放弃（重连成功即重置计数）
+const MAX_RECONNECT = 100
+// 重连基础间隔（秒）：前 3 次快速重试，之后按基础间隔重试
+const RECONNECT_BASE_DELAY = 10
+// 心跳看门狗检测周期（毫秒）
+const HEARTBEAT_WATCHDOG_INTERVAL = 15000
+// 收包空闲超时（毫秒）：超过该时长未收到任何 Stream 帧即判定半开连接，主动断开重连
+const HEARTBEAT_IDLE_TIMEOUT = 90000
+
 const adapter = new (class DingTalkAdapter {
   constructor() {
     this.id = "DingDing"
@@ -47,6 +56,8 @@ const adapter = new (class DingTalkAdapter {
     this.path = this.name
     // 已管理账号：accountId -> { config, bot, socket, timer }
     this.managedAccounts = new Map()
+    // 断线重连计数：accountId -> 已重试次数（连接成功后重置）
+    this.reconnectCounts = new Map()
     // 缓存池（key -> { value, expires }）：用户详情 / 群机器人列表，各缓存一天
     this.userInfoCache = new Map()
     this.groupRobotCache = new Map()
@@ -333,7 +344,7 @@ const adapter = new (class DingTalkAdapter {
       if (account.autoReconnect !== false) this.scheduleReconnect(account)
       return
     }
-    const entry = { config: account, bot, socket }
+    const entry = { config: account, bot, socket, heartbeatTimer: null, lastFrameAt: Date.now() }
     this.managedAccounts.set(accountId, entry)
     // 配置中的机器人头像是带签名的临时链接时，启动即转存为稳定地址（避免过期失效）
     if (account.botAvatar && /(x-oss-signature|ossaccesskeyid|expires=|signature=)/i.test(account.botAvatar))
@@ -351,19 +362,68 @@ const adapter = new (class DingTalkAdapter {
         robotCode: account.robotCode,
       }).catch(() => {})
     socket.on("open", () => {
+      // 连接成功重置重连计数
+      this.reconnectCounts.delete(accountId)
       this.log("mark", bot.self_id, `钉钉机器人 ${bot.self_id} 已连接`)
+      // 客户端主动心跳 + 收包空闲看门狗：及时发现半开连接（对端已断但本地无 close 事件）
+      this.startHeartbeat(entry)
       Bot.em(`connect.${bot.self_id}`, { self_id: bot.self_id, bot })
     })
-    socket.on("message", data => this.handleStreamMessage(entry, data))
+    socket.on("message", data => {
+      entry.lastFrameAt = Date.now()
+      this.handleStreamMessage(entry, data)
+    })
+    // WebSocket 协议层 pong：与官方 SDK 一致用原生 ping 保活，pong 到达同样刷新存活时间
+    socket.on("pong", () => {
+      entry.lastFrameAt = Date.now()
+    })
     socket.on("error", error => this.log("error", bot.self_id, "Stream 错误", error))
     socket.on("close", () => {
       // 已被重连接管（socket 已更换）时不再处理
       const current = this.managedAccounts.get(accountId)
-      if (current?.socket !== socket) return
+      if (current?.socket !== socket) {
+        this.stopHeartbeat(entry)
+        return
+      }
       this.managedAccounts.delete(accountId)
+      this.stopHeartbeat(entry)
       this.log("warn", bot.self_id, "Stream 已断开")
       if (account.autoReconnect !== false) this.scheduleReconnect(account)
     })
+  }
+
+  // 心跳保活：客户端定时发送 WebSocket 协议层 ping（与钉钉官方 SDK 一致），
+  // 并由看门狗在收包空闲超时时判定连接死亡（解决半开连接不触发 close 的问题）
+  startHeartbeat(entry) {
+    this.stopHeartbeat(entry)
+    entry.lastFrameAt = Date.now()
+    entry.heartbeatTimer = setInterval(() => {
+      const current = this.managedAccounts.get(String(entry.config.accountId || entry.config.clientId || "default"))
+      if (current?.socket !== entry.socket) return this.stopHeartbeat(entry)
+      if (entry.socket?.readyState !== WebSocket.OPEN) return
+      // 收包空闲超时：超过阈值未收到任何帧（含 pong），说明连接已静默死亡，主动断开触发重连
+      const gap = Date.now() - (entry.lastFrameAt || 0)
+      if (gap > HEARTBEAT_IDLE_TIMEOUT) {
+        this.log("warn", entry.bot.self_id, `心跳超时（${Math.round(gap / 1000)}s 未收到服务端响应），主动重连`)
+        this.stopHeartbeat(entry)
+        try { entry.socket.terminate() } catch {}
+        return
+      }
+      // WebSocket 协议层 ping，服务端自动回 pong；pong 事件刷新 lastFrameAt
+      try {
+        entry.socket.ping()
+      } catch (error) {
+        this.log("debug", entry.bot.self_id, "心跳 ping 发送失败", error)
+      }
+    }, HEARTBEAT_WATCHDOG_INTERVAL)
+    if (typeof entry.heartbeatTimer.unref === "function") entry.heartbeatTimer.unref()
+  }
+
+  stopHeartbeat(entry) {
+    if (entry?.heartbeatTimer) {
+      clearInterval(entry.heartbeatTimer)
+      entry.heartbeatTimer = null
+    }
   }
 
   // 断开账号连接并清理定时器（保留配置）
@@ -371,21 +431,37 @@ const adapter = new (class DingTalkAdapter {
     const entry = this.managedAccounts.get(String(accountId))
     if (!entry) return false
     this.managedAccounts.delete(String(accountId))
+    this.reconnectCounts.delete(String(accountId))
+    this.stopHeartbeat(entry)
     clearTimeout(entry.config?.tokenTimer)
     clearTimeout(entry.timer)
     entry.socket?.close()
     return true
   }
 
-  // 断线重连：按账号去重，同一账号仅一个等待中的定时器
+  // 断线重连：断开即自动尝试重连，计数 1/100，连接成功后由 open 事件重置计数；
+  // 同一账号仅保留一个等待中的定时器，避免重复叠加
   scheduleReconnect(account) {
     const accountId = String(account.accountId || account.clientId || "default")
     if (this.managedAccounts.get(accountId)?.timer) return
+    const count = (this.reconnectCounts.get(accountId) || 0) + 1
+    const botId = account.platformId ? this.platformKey(account.platformId) : accountId
+    if (count > MAX_RECONNECT) {
+      this.reconnectCounts.delete(accountId)
+      this.log("error", botId, `断线重连已达上限 ${MAX_RECONNECT} 次，放弃重连，请重启或检查网络/凭证`)
+      return
+    }
+    this.reconnectCounts.set(accountId, count)
+    // 前 3 次快速重试（1s），之后按基础间隔；兼容旧配置 reconnectInterval（秒）
+    const delay = count > 3
+      ? Math.max(1000, Number(account.reconnectInterval || RECONNECT_BASE_DELAY) * 1000)
+      : 1000
+    this.log("warn", botId, `连接断开，${Math.round(delay / 1000)}s 后第 ${count}/${MAX_RECONNECT} 次重连`)
     const timer = setTimeout(() => {
       const entry = this.managedAccounts.get(accountId)
       if (entry) delete entry.timer
       this.startAccount(account).catch(error => this.log("error", accountId, error))
-    }, Math.max(1000, Number(account.reconnectInterval || 10) * 1000))
+    }, delay)
     const old = this.managedAccounts.get(accountId) || {}
     this.managedAccounts.set(accountId, { ...old, config: account, timer })
   }
@@ -1531,6 +1607,13 @@ const adapter = new (class DingTalkAdapter {
           return entry.socket.send(
             JSON.stringify({ code: 200, headers: envelope.headers, message: "OK", data: envelope.data }),
           )
+        // 服务端主动要求断开（SYSTEM/disconnect）：关闭当前连接，交由 close 事件触发重连
+        if (envelope.type === "SYSTEM" && envelope.headers?.topic === "disconnect") {
+          this.log("warn", entry.bot.self_id, "服务端要求断开连接，正在重连")
+          this.stopHeartbeat(entry)
+          try { entry.socket.close() } catch {}
+          return
+        }
         if (envelope.type !== "CALLBACK") return
         // 互动卡片回调事件（callbackType=STREAM）：按钮点击/回传请求，透传给脚本监听
         if (envelope.headers?.topic === "/v1.0/card/instances/callback") {
